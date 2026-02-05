@@ -1,4 +1,5 @@
 //! 텍스트 교체 (Backspace + Paste 시뮬레이션)
+#![allow(deprecated)] // cocoa 크레이트 deprecated API 사용
 
 use cocoa::appkit::NSPasteboard;
 use cocoa::base::{id, nil};

@@ -1,4 +1,5 @@
 //! macOS 메뉴바 앱 (NSStatusBar)
+#![allow(deprecated)] // cocoa 크레이트 deprecated API 사용
 
 use cocoa::appkit::{
     NSApp, NSApplication, NSApplicationActivationPolicyAccessory, NSMenu, NSMenuItem, NSStatusBar,

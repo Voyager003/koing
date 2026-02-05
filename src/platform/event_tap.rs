@@ -1,6 +1,5 @@
 //! CGEventTap을 사용한 키보드 이벤트 감지
 
-use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
