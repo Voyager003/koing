@@ -1,6 +1,40 @@
 [package]
 name = "koing"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "macOS Korean-English auto-converter"
+license = "MIT"
+
+[lib]
+name = "koing"
+path = "src/lib.rs"
+
+[[bin]]
+name = "koing"
+path = "src/main.rs"
 
 [dependencies]
+# macOS system APIs
+core-graphics = "0.24"
+core-foundation = "0.10"
+cocoa = "0.26"
+objc = "0.2"
+
+# Utilities
+lazy_static = "1.5"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\"))"] }
+
+[dev-dependencies]
+
+[package.metadata.bundle]
+name = "Koing"
+identifier = "com.koing.app"
+category = "public.app-category.utilities"
+short_description = "Korean-English auto-converter for macOS"
+osx_minimum_system_version = "13.0"
