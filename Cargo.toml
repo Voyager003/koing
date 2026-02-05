@@ -14,5 +14,21 @@ name = "koing"
 path = "src/main.rs"
 
 [dependencies]
+# macOS system APIs
+core-graphics = "0.24"
+core-foundation = "0.10"
+cocoa = "0.26"
+objc = "0.2"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
 
 [dev-dependencies]
+
+[package.metadata.bundle]
+name = "Koing"
+identifier = "com.koing.app"
+category = "public.app-category.utilities"
+short_description = "Korean-English auto-converter for macOS"
+osx_minimum_system_version = "13.0"
