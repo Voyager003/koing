@@ -5,6 +5,64 @@
 use std::collections::HashSet;
 
 lazy_static::lazy_static! {
+    /// 흔한 영어 단어 목록 - 이 단어들은 자동 변환에서 제외
+    pub static ref COMMON_ENGLISH_WORDS: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        // 3글자 영어 단어
+        for w in ["the", "and", "for", "are", "but", "not", "you", "all",
+                  "can", "had", "her", "was", "one", "our", "out", "has",
+                  "his", "how", "its", "let", "may", "new", "now", "old",
+                  "see", "two", "way", "who", "did", "get", "com", "use",
+                  "man", "day", "too", "any", "put", "say", "she", "own",
+                  "try", "set", "run", "end", "act", "ask", "big", "buy",
+                  "cut", "far", "few", "got", "him", "hot", "job", "key",
+                  "low", "lot", "off", "pay", "per", "red", "sit", "six",
+                  "ten", "top", "war", "why", "yes", "yet", "ago", "air",
+                  "art", "bad", "bed", "bit", "box", "car", "cup", "dog",
+                  "eat", "eye", "fly", "fun", "god", "gun", "hit", "law",
+                  "lie", "map", "oil", "old", "add", "age", "arm", "bag",
+                  "bar", "bus", "cry", "die", "dry", "ear", "egg", "fan",
+                  "fat", "fit", "gas", "hat", "ice", "kid", "lap", "leg",
+                  "lip", "mix", "net", "nor", "nut", "odd", "pan", "pet",
+                  "pie", "pin", "pop", "pot", "raw", "row", "sad", "sea",
+                  "sky", "son", "sun", "tax", "tea", "tie", "tip", "via",
+                  "wet", "win", "won", "app", "web", "api", "url", "dev"] {
+            set.insert(w);
+        }
+        // 4글자 영어 단어
+        for w in ["that", "with", "have", "this", "will", "your", "from",
+                  "they", "been", "call", "come", "made", "find", "long",
+                  "down", "side", "more", "each", "said", "time", "very",
+                  "when", "make", "only", "here", "must", "into", "year",
+                  "take", "them", "some", "then", "than", "look", "also",
+                  "well", "back", "over", "such", "good", "give", "most",
+                  "just", "even", "work", "know", "life", "hand", "part",
+                  "code", "file", "test", "data", "user", "type", "name",
+                  "list", "help", "want", "need", "open", "save", "edit",
+                  "view", "show", "hide", "read", "send", "copy", "move",
+                  "text", "link", "next", "home", "page", "form", "true",
+                  "null", "void", "self", "func", "main", "init", "free",
+                  "size", "loop", "bool", "byte", "char", "case", "else",
+                  "enum", "goto", "left", "last", "none", "pass", "push",
+                  "pull", "sort", "stop", "wait", "wrap", "exit", "like"] {
+            set.insert(w);
+        }
+        // 5글자+ 영어 단어
+        for w in ["hello", "world", "there", "which", "their", "would", "about",
+                  "these", "could", "other", "after", "first", "never", "where",
+                  "those", "being", "every", "under", "think", "still", "while",
+                  "found", "great", "right", "three", "place", "thing", "point",
+                  "string", "function", "return", "public", "private", "static",
+                  "class", "const", "import", "export", "default", "async", "await",
+                  "break", "catch", "throw", "final", "super", "print", "input",
+                  "output", "error", "value", "array", "index", "count", "start",
+                  "false", "begin", "check", "clear", "close", "build", "write",
+                  "event", "state", "props", "style", "click", "focus", "fetch"] {
+            set.insert(w);
+        }
+        set
+    };
+
     /// 한글 가능성이 높은 바이그램 패턴
     /// 두벌식에서 자음+모음 조합 (예: rk = ㄱ+ㅏ)
     pub static ref HANGUL_BIGRAMS: HashSet<&'static str> = {

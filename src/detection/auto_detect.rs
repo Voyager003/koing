@@ -2,22 +2,31 @@
 //!
 //! 휴리스틱 기반으로 입력이 한글인지 영어인지 판별합니다.
 
-use super::patterns::{is_consonant_key, is_vowel_key, ENGLISH_BIGRAMS, HANGUL_BIGRAMS};
+use super::patterns::{
+    is_consonant_key, is_vowel_key, COMMON_ENGLISH_WORDS, ENGLISH_BIGRAMS, HANGUL_BIGRAMS,
+};
+use super::validator::has_excessive_jamo;
 
 /// 자동 감지기 설정
 #[derive(Debug, Clone)]
 pub struct AutoDetectorConfig {
-    /// 변환을 위한 최소 신뢰도 (0.0 ~ 100.0)
+    /// 변환을 위한 최소 신뢰도 (0.0 ~ 100.0) - Space/Enter 시 사용
     pub threshold: f32,
+    /// 실시간 변환을 위한 신뢰도 (더 높음)
+    pub realtime_threshold: f32,
     /// 감지를 위한 최소 버퍼 길이
     pub min_length: usize,
+    /// Debounce 타이머 밀리초
+    pub debounce_ms: u64,
 }
 
 impl Default for AutoDetectorConfig {
     fn default() -> Self {
         Self {
             threshold: 70.0,
+            realtime_threshold: 80.0,
             min_length: 3,
+            debounce_ms: 300,
         }
     }
 }
@@ -53,7 +62,7 @@ impl AutoDetector {
         self.enabled
     }
 
-    /// 입력 버퍼가 한글로 변환되어야 하는지 판별
+    /// 입력 버퍼가 한글로 변환되어야 하는지 판별 (Space/Enter 시 사용)
     pub fn should_convert(&self, buffer: &str) -> bool {
         if !self.enabled {
             return false;
@@ -63,7 +72,55 @@ impl AutoDetector {
             return false;
         }
 
+        // 영어 단어 필터: 흔한 영어 단어는 변환하지 않음
+        let lower = buffer.to_lowercase();
+        if COMMON_ENGLISH_WORDS.contains(lower.as_str()) {
+            return false;
+        }
+
         self.get_confidence(buffer) >= self.config.threshold
+    }
+
+    /// 변환 결과가 유효한지 검증 (낱자모 비율 체크)
+    /// 변환 후 호출하여 결과를 검증
+    pub fn is_valid_conversion(&self, converted: &str) -> bool {
+        // 빈 결과는 무효
+        if converted.is_empty() {
+            return false;
+        }
+
+        // 낱자모가 50% 이상이면 무효
+        if has_excessive_jamo(converted) {
+            return false;
+        }
+
+        true
+    }
+
+    /// 실시간 변환 여부 판별 (debounce 타이머 만료 시 사용)
+    /// 더 높은 신뢰도와 영어 단어 필터링 적용
+    pub fn should_convert_realtime(&self, buffer: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        if buffer.len() < self.config.min_length {
+            return false;
+        }
+
+        // 영어 단어 필터: 흔한 영어 단어는 변환하지 않음
+        let lower = buffer.to_lowercase();
+        if COMMON_ENGLISH_WORDS.contains(lower.as_str()) {
+            return false;
+        }
+
+        // 높은 신뢰도 요구
+        self.get_confidence(buffer) >= self.config.realtime_threshold
+    }
+
+    /// debounce 타이머 값 반환
+    pub fn debounce_ms(&self) -> u64 {
+        self.config.debounce_ms
     }
 
     /// 입력 버퍼의 한글 신뢰도 계산 (0.0 ~ 100.0)
@@ -267,5 +324,76 @@ mod tests {
         let detector = AutoDetector::with_defaults();
         assert!(!detector.should_convert(""));
         assert_eq!(detector.get_confidence(""), 0.0);
+    }
+
+    #[test]
+    fn test_realtime_should_convert_hangul() {
+        let detector = AutoDetector::with_defaults();
+
+        // 한글 패턴은 실시간 변환됨
+        assert!(detector.should_convert_realtime("dkssud")); // 안녕
+        assert!(detector.should_convert_realtime("gksrmf")); // 한글
+        assert!(detector.should_convert_realtime("rkskek")); // 가나다
+    }
+
+    #[test]
+    fn test_realtime_should_not_convert_english_words() {
+        let detector = AutoDetector::with_defaults();
+
+        // 흔한 영어 단어는 실시간 변환되지 않음
+        assert!(!detector.should_convert_realtime("hello"));
+        assert!(!detector.should_convert_realtime("world"));
+        assert!(!detector.should_convert_realtime("code"));
+        assert!(!detector.should_convert_realtime("file"));
+        assert!(!detector.should_convert_realtime("the"));
+        assert!(!detector.should_convert_realtime("and"));
+    }
+
+    #[test]
+    fn test_realtime_short_buffer() {
+        let detector = AutoDetector::with_defaults();
+
+        // 짧은 버퍼는 변환되지 않음
+        assert!(!detector.should_convert_realtime("rk")); // 2글자
+    }
+
+    #[test]
+    fn test_debounce_ms() {
+        let detector = AutoDetector::with_defaults();
+        assert_eq!(detector.debounce_ms(), 300);
+    }
+
+    #[test]
+    fn test_should_convert_filters_english_words() {
+        let detector = AutoDetector::with_defaults();
+
+        // 영어 단어는 Space/Enter 시에도 변환하지 않음
+        assert!(!detector.should_convert("name"));
+        assert!(!detector.should_convert("game"));
+        assert!(!detector.should_convert("time"));
+        assert!(!detector.should_convert("home"));
+        assert!(!detector.should_convert("code"));
+        assert!(!detector.should_convert("file"));
+    }
+
+    #[test]
+    fn test_is_valid_conversion() {
+        let detector = AutoDetector::with_defaults();
+
+        // 유효한 변환 결과
+        assert!(detector.is_valid_conversion("안녕"));
+        assert!(detector.is_valid_conversion("가나다"));
+        assert!(detector.is_valid_conversion("한글"));
+
+        // 낱자모가 50% 미만이면 유효 (부분적 오류 허용)
+        assert!(detector.is_valid_conversion("쏘ㅓㄷ아지는")); // 6글자 중 2글자 낱자모 = 33%
+        assert!(detector.is_valid_conversion("안녕ㅎ")); // 3글자 중 1글자 낱자모 = 33%
+
+        // 무효한 변환 결과 (낱자모 50% 이상)
+        assert!(!detector.is_valid_conversion("ㅜ믇")); // 2글자 중 1글자 낱자모 = 50%
+        assert!(!detector.is_valid_conversion("ㄱㅏㄴㅏ")); // 100% 낱자모
+
+        // 빈 문자열
+        assert!(!detector.is_valid_conversion(""));
     }
 }

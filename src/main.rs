@@ -1,10 +1,12 @@
 //! Koing - macOS 한영 자동변환 프로그램
 
 use koing::convert;
+use koing::detection::has_excessive_jamo;
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
+    input_source::switch_to_korean,
     permissions::{permission_status_string, request_accessibility_permission},
-    text_replacer::replace_text,
+    text_replacer::{replace_text, undo_replace_text},
 };
 use koing::ui::menubar::MenuBarApp;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,8 +37,11 @@ fn main() {
     }
 
     println!();
-    println!("단축키: ⌥ Option + Space");
-    println!("영문을 입력한 후 단축키를 누르면 한글로 변환됩니다.");
+    println!("단축키:");
+    println!("  - ⌥ Option + Space: 수동 한글 변환");
+    println!("  - ⌥ Option + Z: 마지막 변환 되돌리기 (Undo)");
+    println!();
+    println!("실시간 모드: 타이핑 후 300ms 대기 시 자동 변환");
     println!();
 
     // 앱 실행 상태
@@ -45,6 +50,9 @@ fn main() {
     // 이벤트 탭 상태
     let event_state = Arc::new(EventTapState::new(HotkeyConfig::default()));
 
+    // 변환 이력 저장용 Arc 클론
+    let event_state_for_callback = Arc::clone(&event_state);
+
     // 변환 콜백 설정
     event_state.set_convert_callback(move |buffer: String| {
         log::info!("변환 요청: '{}'", buffer);
@@ -52,10 +60,34 @@ fn main() {
         let hangul = convert(&buffer);
         log::info!("변환 결과: '{}' -> '{}'", buffer, hangul);
 
+        // 변환 결과 검증: 낱자모가 50% 이상이면 변환 취소
+        if has_excessive_jamo(&hangul) {
+            log::info!("변환 취소: 낱자모 과다 ('{}')", hangul);
+            return;
+        }
+
         // 텍스트 교체
         let backspace_count = buffer.chars().count();
         if let Err(e) = replace_text(backspace_count, &hangul) {
             log::error!("텍스트 교체 실패: {}", e);
+            return;
+        }
+
+        // 변환 이력 저장 (Undo용)
+        event_state_for_callback.save_conversion_history(buffer, hangul);
+
+        // 한글 입력 소스로 전환
+        if let Err(e) = switch_to_korean() {
+            log::warn!("한글 전환 실패: {}", e);
+        }
+    });
+
+    // Undo 콜백 설정
+    event_state.set_undo_callback(|hangul: String, original: String| {
+        log::info!("Undo 요청: '{}' -> '{}'", hangul, original);
+
+        if let Err(e) = undo_replace_text(&hangul, &original) {
+            log::error!("Undo 텍스트 교체 실패: {}", e);
         }
     });
 

@@ -93,23 +93,32 @@ fn simulate_key(keycode: CGKeyCode, key_down: bool, flags: CGEventFlags) -> Resu
 fn simulate_backspace() -> Result<(), String> {
     const BACKSPACE_KEYCODE: CGKeyCode = 51;
     simulate_key(BACKSPACE_KEYCODE, true, CGEventFlags::empty())?;
-    thread::sleep(Duration::from_micros(500));
+    thread::sleep(Duration::from_millis(2));
     simulate_key(BACKSPACE_KEYCODE, false, CGEventFlags::empty())?;
-    thread::sleep(Duration::from_micros(500));
+    thread::sleep(Duration::from_millis(2));
     Ok(())
 }
 
 /// Cmd+V (붙여넣기) 시뮬레이션
 fn simulate_paste() -> Result<(), String> {
     const V_KEYCODE: CGKeyCode = 9;
+    const COMMAND_KEYCODE: CGKeyCode = 55; // Left Command
 
-    // Cmd 키 다운
+    // 1. Command 키 다운
+    simulate_key(COMMAND_KEYCODE, true, CGEventFlags::CGEventFlagCommand)?;
+    thread::sleep(Duration::from_millis(5));
+
+    // 2. V 키 다운 (Command 플래그 포함)
     simulate_key(V_KEYCODE, true, CGEventFlags::CGEventFlagCommand)?;
-    thread::sleep(Duration::from_micros(500));
+    thread::sleep(Duration::from_millis(5));
 
-    // Cmd 키 업
+    // 3. V 키 업
     simulate_key(V_KEYCODE, false, CGEventFlags::CGEventFlagCommand)?;
-    thread::sleep(Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(5));
+
+    // 4. Command 키 업
+    simulate_key(COMMAND_KEYCODE, false, CGEventFlags::empty())?;
+    thread::sleep(Duration::from_millis(20));
 
     Ok(())
 }
@@ -130,18 +139,59 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
         simulate_backspace()?;
     }
 
-    // 약간의 딜레이
-    thread::sleep(Duration::from_millis(10));
+    // 약간의 딜레이 (Backspace 처리 완료 대기)
+    thread::sleep(Duration::from_millis(20));
 
     // 3. 새 텍스트를 클립보드에 복사
     set_clipboard_string(new_text);
+
+    // 클립보드 설정 완료 대기 (중요: 비동기 처리 대기)
+    thread::sleep(Duration::from_millis(50));
 
     // 4. Cmd+V로 붙여넣기
     simulate_paste()?;
 
     // 5. 클립보드 복원 (앱이 붙여넣기를 완료할 때까지 충분한 딜레이)
-    // 50ms는 불충분 - 앱이 Cmd+V를 처리하기 전에 클립보드가 복원되는 race condition 발생
-    thread::sleep(Duration::from_millis(300));
+    // 300ms는 불충분한 경우가 있음 - 500ms로 증가
+    thread::sleep(Duration::from_millis(500));
+    backup.restore();
+
+    Ok(())
+}
+
+/// Undo 텍스트 교체 실행 (한글 → 원본 영문 복원)
+/// - hangul_text: 현재 입력된 한글 텍스트
+/// - original_text: 복원할 원본 영문 텍스트
+pub fn undo_replace_text(hangul_text: &str, original_text: &str) -> Result<(), String> {
+    if original_text.is_empty() {
+        return Ok(());
+    }
+
+    // 한글은 조합 문자이므로 chars().count()로 정확한 문자 수 계산
+    let backspace_count = hangul_text.chars().count();
+
+    // 1. 클립보드 백업
+    let backup = ClipboardBackup::save();
+
+    // 2. Backspace로 한글 텍스트 삭제
+    for _ in 0..backspace_count {
+        simulate_backspace()?;
+    }
+
+    // 약간의 딜레이
+    thread::sleep(Duration::from_millis(20));
+
+    // 3. 원본 영문 텍스트를 클립보드에 복사
+    set_clipboard_string(original_text);
+
+    // 클립보드 설정 완료 대기
+    thread::sleep(Duration::from_millis(50));
+
+    // 4. Cmd+V로 붙여넣기
+    simulate_paste()?;
+
+    // 5. 클립보드 복원
+    thread::sleep(Duration::from_millis(500));
     backup.restore();
 
     Ok(())

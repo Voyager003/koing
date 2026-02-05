@@ -192,7 +192,6 @@ impl HangulFsm {
         }
         self.reset_state();
     }
-
     /// 상태 초기화
     fn reset_state(&mut self) {
         self.state = State::Empty;
