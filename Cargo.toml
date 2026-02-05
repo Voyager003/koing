@@ -1,6 +1,18 @@
 [package]
 name = "koing"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "macOS Korean-English auto-converter"
+license = "MIT"
+
+[lib]
+name = "koing"
+path = "src/lib.rs"
+
+[[bin]]
+name = "koing"
+path = "src/main.rs"
 
 [dependencies]
+
+[dev-dependencies]
