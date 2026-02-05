@@ -20,6 +20,9 @@ core-foundation = "0.10"
 cocoa = "0.26"
 objc = "0.2"
 
+# Utilities
+lazy_static = "1.5"
+
 # Logging
 log = "0.4"
 env_logger = "0.11"

@@ -1,5 +1,6 @@
 //! CGEventTap을 사용한 키보드 이벤트 감지
 
+use crate::detection::AutoDetector;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -132,6 +133,7 @@ pub struct EventTapState {
     pub buffer: Mutex<KeyBuffer>,
     pub hotkey: HotkeyConfig,
     pub running: AtomicBool,
+    pub auto_detector: Mutex<AutoDetector>,
     pub on_convert: Mutex<Option<Box<dyn Fn(String) + Send + 'static>>>,
 }
 
@@ -141,6 +143,7 @@ impl EventTapState {
             buffer: Mutex::new(KeyBuffer::new(100)),
             hotkey,
             running: AtomicBool::new(true),
+            auto_detector: Mutex::new(AutoDetector::default()),
             on_convert: Mutex::new(None),
         }
     }
@@ -151,6 +154,21 @@ impl EventTapState {
     {
         let mut on_convert = self.on_convert.lock().unwrap();
         *on_convert = Some(Box::new(callback));
+    }
+
+    /// 자동 감지 활성화/비활성화
+    pub fn set_auto_detect_enabled(&self, enabled: bool) {
+        if let Ok(mut detector) = self.auto_detector.lock() {
+            detector.set_enabled(enabled);
+        }
+    }
+
+    /// 자동 감지 활성화 여부
+    pub fn is_auto_detect_enabled(&self) -> bool {
+        self.auto_detector
+            .lock()
+            .map(|d| d.is_enabled())
+            .unwrap_or(false)
     }
 }
 
@@ -229,14 +247,41 @@ fn handle_event(
             // 일반 키 입력 처리
             let shift_pressed = flags.contains(CGEventFlags::CGEventFlagShift);
 
-            // 버퍼 초기화 조건: Enter, Tab, Escape, 방향키
-            if matches!(keycode, 36 | 48 | 53 | 123..=126) {
+            // 버퍼 초기화 조건: Tab, Escape, 방향키
+            if matches!(keycode, 48 | 53 | 123..=126) {
                 state.buffer.lock().unwrap().clear();
                 return Some(event.clone());
             }
 
-            // Space (단축키 없이)
-            if keycode == 49 {
+            // Space 또는 Enter 입력 시 자동 감지 체크
+            if keycode == 49 || keycode == 36 {
+                // 49 = Space, 36 = Enter
+                let should_convert = {
+                    let buffer = state.buffer.lock().unwrap();
+                    let detector = state.auto_detector.lock().unwrap();
+                    detector.should_convert(buffer.get())
+                };
+
+                if should_convert {
+                    // 자동 변환 트리거
+                    let buffer_content = {
+                        let mut buffer = state.buffer.lock().unwrap();
+                        let content = buffer.get().to_string();
+                        buffer.clear();
+                        content
+                    };
+
+                    if !buffer_content.is_empty() {
+                        if let Some(callback) = state.on_convert.lock().unwrap().as_ref() {
+                            callback(buffer_content);
+                        }
+                    }
+
+                    // 이벤트는 통과시킴 (Space/Enter는 정상 입력되어야 함)
+                    return Some(event.clone());
+                }
+
+                // 자동 감지 조건 미충족 시 버퍼만 초기화
                 state.buffer.lock().unwrap().clear();
                 return Some(event.clone());
             }

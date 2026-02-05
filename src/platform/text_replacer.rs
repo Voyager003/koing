@@ -139,8 +139,9 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
     // 4. Cmd+V로 붙여넣기
     simulate_paste()?;
 
-    // 5. 클립보드 복원 (약간의 딜레이 후)
-    thread::sleep(Duration::from_millis(50));
+    // 5. 클립보드 복원 (앱이 붙여넣기를 완료할 때까지 충분한 딜레이)
+    // 50ms는 불충분 - 앱이 Cmd+V를 처리하기 전에 클립보드가 복원되는 race condition 발생
+    thread::sleep(Duration::from_millis(300));
     backup.restore();
 
     Ok(())
