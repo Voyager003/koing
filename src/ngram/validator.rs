@@ -10,6 +10,7 @@ use crate::detection::validator::has_incomplete_jamo;
 
 use super::config::NgramConfig;
 use super::model::NgramModel;
+use super::syllable_validator::check_syllable_structure;
 
 /// N-gram 기반 한글 검증기
 ///
@@ -100,6 +101,11 @@ impl KoreanValidator {
             return false;
         }
 
+        // 2.5단계: 음절 구조 검사
+        if !check_syllable_structure(&converted) {
+            return false;
+        }
+
         // 3단계: N-gram 스코어 검사 (모델이 있는 경우만)
         if let Some(ref model) = self.model {
             let score = model.score_with_config(&converted, &self.config);
@@ -126,16 +132,19 @@ impl KoreanValidator {
     pub fn analyze(&self, english_input: &str) -> ValidationResult {
         let converted = convert(english_input);
         let has_jamo = has_incomplete_jamo(&converted);
+        let syllable_valid = check_syllable_structure(&converted);
         let score = self.score(&converted);
 
         let should_convert = !has_jamo
             && converted != english_input
+            && syllable_valid
             && score.map(|s| s >= self.config.threshold).unwrap_or(true);
 
         ValidationResult {
             original: english_input.to_string(),
             converted,
             has_incomplete_jamo: has_jamo,
+            has_unnatural_syllables: !syllable_valid,
             ngram_score: score,
             should_convert,
         }
@@ -161,6 +170,8 @@ pub struct ValidationResult {
     pub converted: String,
     /// 낱자모 포함 여부
     pub has_incomplete_jamo: bool,
+    /// 비자연스러운 음절 구조 포함 여부
+    pub has_unnatural_syllables: bool,
     /// N-gram 스코어 (모델이 없으면 None)
     pub ngram_score: Option<f64>,
     /// 최종 판정: 한글로 변환해야 하는지
@@ -294,6 +305,30 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_english_words_unnatural_syllables() {
+        let validator = KoreanValidator::new();
+
+        // "daisy" → "ㅇ먀뇨" — jamo(ㅇ) + 희귀 음절(먀)
+        assert!(!validator.should_convert_to_korean("daisy"));
+
+        // "virus" → "퍄견" — 희귀 음절(퍄)
+        assert!(!validator.should_convert_to_korean("virus"));
+    }
+
+    #[test]
+    fn test_analyze_unnatural_syllables() {
+        let validator = KoreanValidator::new();
+
+        let result = validator.analyze("daisy");
+        assert!(result.has_unnatural_syllables || result.has_incomplete_jamo);
+        assert!(!result.should_convert);
+
+        let result = validator.analyze("virus");
+        assert!(result.has_unnatural_syllables);
+        assert!(!result.should_convert);
     }
 
     #[test]

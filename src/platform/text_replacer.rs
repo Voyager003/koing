@@ -4,11 +4,20 @@
 use cocoa::appkit::NSPasteboard;
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSArray, NSString};
-use core_graphics::event::{CGEvent, CGEventFlags, CGKeyCode};
+use core_graphics::event::{CGEvent, CGEventFlags, CGKeyCode, EventField};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use objc::{msg_send, sel, sel_impl};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+
+/// Koing이 생성한 합성 이벤트를 식별하는 마커 값
+pub const KOING_SYNTHETIC_EVENT_MARKER: i64 = 0x4B4F494E47; // "KOING"
+
+lazy_static::lazy_static! {
+    /// 클립보드 작업 직렬화를 위한 글로벌 Mutex
+    static ref CLIPBOARD_MUTEX: Mutex<()> = Mutex::new(());
+}
 
 /// 클립보드 내용을 백업하고 복원하는 구조체
 pub struct ClipboardBackup {
@@ -100,13 +109,14 @@ fn wait_for_clipboard(expected: &str, max_wait_ms: u64) -> bool {
 
 /// 키 이벤트 시뮬레이션
 fn simulate_key(keycode: CGKeyCode, key_down: bool, flags: CGEventFlags) -> Result<(), String> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+    let source = CGEventSource::new(CGEventSourceStateID::Private)
         .map_err(|_| "CGEventSource 생성 실패")?;
 
     let event =
         CGEvent::new_keyboard_event(source, keycode, key_down).map_err(|_| "CGEvent 생성 실패")?;
 
     event.set_flags(flags);
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, KOING_SYNTHETIC_EVENT_MARKER);
     event.post(core_graphics::event::CGEventTapLocation::HID);
 
     Ok(())
@@ -154,6 +164,11 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
         return Ok(());
     }
 
+    // 클립보드 작업 직렬화 — 동시 변환 요청 방지
+    let _lock = CLIPBOARD_MUTEX
+        .lock()
+        .map_err(|e| format!("클립보드 Mutex 획득 실패: {}", e))?;
+
     // 1. 클립보드 백업
     let backup = ClipboardBackup::save();
 
@@ -177,7 +192,8 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
     simulate_paste()?;
 
     // 6. 클립보드 복원 (앱이 붙여넣기를 완료할 때까지 충분한 딜레이)
-    thread::sleep(Duration::from_millis(300));
+    // 느린 앱(Electron 등)도 붙여넣기를 완료할 수 있도록 1500ms 대기
+    thread::sleep(Duration::from_millis(1500));
     backup.restore();
 
     Ok(())
@@ -190,6 +206,11 @@ pub fn undo_replace_text(hangul_text: &str, original_text: &str) -> Result<(), S
     if original_text.is_empty() {
         return Ok(());
     }
+
+    // 클립보드 작업 직렬화 — 동시 변환 요청 방지
+    let _lock = CLIPBOARD_MUTEX
+        .lock()
+        .map_err(|e| format!("클립보드 Mutex 획득 실패: {}", e))?;
 
     // 한글은 조합 문자이므로 chars().count()로 정확한 문자 수 계산
     let backspace_count = hangul_text.chars().count();
@@ -217,7 +238,8 @@ pub fn undo_replace_text(hangul_text: &str, original_text: &str) -> Result<(), S
     simulate_paste()?;
 
     // 6. 클립보드 복원
-    thread::sleep(Duration::from_millis(300));
+    // 느린 앱(Electron 등)도 붙여넣기를 완료할 수 있도록 1500ms 대기
+    thread::sleep(Duration::from_millis(1500));
     backup.restore();
 
     Ok(())

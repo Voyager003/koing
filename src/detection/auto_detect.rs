@@ -26,7 +26,7 @@ impl Default for AutoDetectorConfig {
             threshold: 70.0,
             realtime_threshold: 80.0,
             min_length: 3,
-            debounce_ms: 300,
+            debounce_ms: 500,
         }
     }
 }
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn test_debounce_ms() {
         let detector = AutoDetector::with_defaults();
-        assert_eq!(detector.debounce_ms(), 300);
+        assert_eq!(detector.debounce_ms(), 500);
     }
 
     #[test]
