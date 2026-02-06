@@ -75,6 +75,29 @@ pub fn set_clipboard_string(content: &str) {
     }
 }
 
+/// 클립보드 설정 완료 대기 (폴링 방식)
+/// - expected: 기대하는 클립보드 내용
+/// - max_wait_ms: 최대 대기 시간 (밀리초)
+/// - 반환: 설정 완료 여부
+fn wait_for_clipboard(expected: &str, max_wait_ms: u64) -> bool {
+    const POLL_INTERVAL_MS: u64 = 5;
+    let max_tries = max_wait_ms / POLL_INTERVAL_MS;
+
+    for _ in 0..max_tries {
+        if let Some(content) = get_clipboard_string() {
+            if content == expected {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+    }
+
+    // 마지막 확인
+    get_clipboard_string()
+        .map(|content| content == expected)
+        .unwrap_or(false)
+}
+
 /// 키 이벤트 시뮬레이션
 fn simulate_key(keycode: CGKeyCode, key_down: bool, flags: CGEventFlags) -> Result<(), String> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -145,15 +168,16 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
     // 3. 새 텍스트를 클립보드에 복사
     set_clipboard_string(new_text);
 
-    // 클립보드 설정 완료 대기 (중요: 비동기 처리 대기)
-    thread::sleep(Duration::from_millis(50));
+    // 4. 클립보드 설정 완료 대기 (폴링 방식, 최대 100ms)
+    if !wait_for_clipboard(new_text, 100) {
+        log::warn!("클립보드 설정 확인 실패, 계속 진행");
+    }
 
-    // 4. Cmd+V로 붙여넣기
+    // 5. Cmd+V로 붙여넣기
     simulate_paste()?;
 
-    // 5. 클립보드 복원 (앱이 붙여넣기를 완료할 때까지 충분한 딜레이)
-    // 300ms는 불충분한 경우가 있음 - 500ms로 증가
-    thread::sleep(Duration::from_millis(500));
+    // 6. 클립보드 복원 (앱이 붙여넣기를 완료할 때까지 충분한 딜레이)
+    thread::sleep(Duration::from_millis(300));
     backup.restore();
 
     Ok(())
@@ -184,14 +208,16 @@ pub fn undo_replace_text(hangul_text: &str, original_text: &str) -> Result<(), S
     // 3. 원본 영문 텍스트를 클립보드에 복사
     set_clipboard_string(original_text);
 
-    // 클립보드 설정 완료 대기
-    thread::sleep(Duration::from_millis(50));
+    // 4. 클립보드 설정 완료 대기 (폴링 방식, 최대 100ms)
+    if !wait_for_clipboard(original_text, 100) {
+        log::warn!("클립보드 설정 확인 실패, 계속 진행");
+    }
 
-    // 4. Cmd+V로 붙여넣기
+    // 5. Cmd+V로 붙여넣기
     simulate_paste()?;
 
-    // 5. 클립보드 복원
-    thread::sleep(Duration::from_millis(500));
+    // 6. 클립보드 복원
+    thread::sleep(Duration::from_millis(300));
     backup.restore();
 
     Ok(())
