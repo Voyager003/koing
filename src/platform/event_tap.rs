@@ -2,16 +2,22 @@
 
 use crate::detection::AutoDetector;
 use crate::platform::input_source::is_english_input_source;
+use crate::platform::text_replacer::KOING_SYNTHETIC_EVENT_MARKER;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, EventField,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+extern "C" {
+    /// macOS CoreGraphics: 이벤트 탭 활성화/비활성화
+    fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+}
 
 /// 키 버퍼 - 입력된 영문 키를 누적
 pub struct KeyBuffer {
@@ -209,7 +215,7 @@ pub struct EventTapState {
     pub hotkey: HotkeyConfig,
     pub running: AtomicBool,
     pub auto_detector: Mutex<AutoDetector>,
-    pub on_convert: Mutex<Option<Box<dyn Fn(String) + Send + 'static>>>,
+    pub on_convert: Mutex<Option<Box<dyn Fn(String, bool) + Send + 'static>>>,
     /// Undo 콜백 (한글 텍스트, 원본 영문 텍스트)
     pub on_undo: Mutex<Option<Box<dyn Fn(String, String) + Send + 'static>>>,
     /// 실시간 모드 활성화 여부
@@ -220,6 +226,10 @@ pub struct EventTapState {
     pub last_key_time: AtomicU64,
     /// 변환 이력 (Undo용)
     pub conversion_history: Mutex<Option<ConversionHistory>>,
+    /// 텍스트 교체 중 여부 (레이스 컨디션 방지)
+    pub is_replacing: AtomicBool,
+    /// CGEventTap mach port (이벤트 탭 재활성화용)
+    tap_port: AtomicPtr<std::ffi::c_void>,
 }
 
 impl EventTapState {
@@ -235,12 +245,14 @@ impl EventTapState {
             debounce_tx: Mutex::new(None),
             last_key_time: AtomicU64::new(0),
             conversion_history: Mutex::new(None),
+            is_replacing: AtomicBool::new(false),
+            tap_port: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
     pub fn set_convert_callback<F>(&self, callback: F)
     where
-        F: Fn(String) + Send + 'static,
+        F: Fn(String, bool) + Send + 'static,
     {
         let mut on_convert = self.on_convert.lock().unwrap();
         *on_convert = Some(Box::new(callback));
@@ -295,6 +307,22 @@ impl EventTapState {
                 original,
                 converted,
             });
+        }
+    }
+
+    /// 이벤트 탭 mach port 설정
+    fn set_tap_port(&self, port: *mut std::ffi::c_void) {
+        self.tap_port.store(port, Ordering::SeqCst);
+    }
+
+    /// 비활성화된 이벤트 탭 재활성화
+    fn reenable_tap(&self) {
+        let port = self.tap_port.load(Ordering::SeqCst);
+        if !port.is_null() {
+            unsafe {
+                CGEventTapEnable(port, true);
+            }
+            log::warn!("이벤트 탭 재활성화됨");
         }
     }
 
@@ -368,6 +396,11 @@ fn trigger_realtime_conversion(state: &EventTapState) {
         return;
     }
 
+    // 텍스트 교체 중이면 실시간 변환 스킵 (레이스 컨디션 방지)
+    if state.is_replacing.load(Ordering::SeqCst) {
+        return;
+    }
+
     let should_convert = {
         let buffer = state.buffer.lock().unwrap();
         if buffer.is_empty() {
@@ -388,7 +421,7 @@ fn trigger_realtime_conversion(state: &EventTapState) {
         if !buffer_content.is_empty() {
             log::info!("[실시간] 변환 트리거: '{}'", buffer_content);
             if let Some(callback) = state.on_convert.lock().unwrap().as_ref() {
-                callback(buffer_content);
+                callback(buffer_content, false); // 실시간 debounce
             }
         }
     }
@@ -410,6 +443,11 @@ pub fn start_event_tap(state: Arc<EventTapState>) -> Result<(), String> {
         move |_proxy, event_type, event| handle_event(&state_clone, event_type, event),
     )
     .map_err(|_| "CGEventTap 생성 실패. Accessibility 권한을 확인하세요.")?;
+
+    // mach port 포인터 저장 (TapDisabledByTimeout 시 재활성화용)
+    use core_foundation::base::TCFType;
+    let raw_port = tap.mach_port.as_concrete_TypeRef() as *mut std::ffi::c_void;
+    state.set_tap_port(raw_port);
 
     unsafe {
         let loop_source = tap
@@ -438,6 +476,24 @@ fn handle_event(
 ) -> Option<CGEvent> {
     if !state.running.load(Ordering::SeqCst) {
         return Some(event.clone());
+    }
+
+    // macOS가 이벤트 탭을 비활성화했으면 즉시 재활성화
+    if matches!(
+        event_type,
+        CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+    ) {
+        log::warn!("이벤트 탭 비활성화 감지: {:?}", event_type);
+        state.reenable_tap();
+        return Some(event.clone());
+    }
+
+    // Koing이 생성한 합성 이벤트는 처리하지 않고 통과
+    if matches!(event_type, CGEventType::KeyDown) {
+        let user_data = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
+        if user_data == KOING_SYNTHETIC_EVENT_MARKER {
+            return Some(event.clone());
+        }
     }
 
     match event_type {
@@ -469,6 +525,9 @@ fn handle_event(
                 && state.hotkey.require_option
                 && option_pressed
             {
+                // Debounce 먼저 취소하여 실시간 변환과의 레이스 방지
+                state.send_debounce_command(DebounceCommand::Cancel);
+
                 // 변환 트리거
                 let buffer_content = {
                     let mut buffer = state.buffer.lock().unwrap();
@@ -478,11 +537,8 @@ fn handle_event(
                 };
 
                 if !buffer_content.is_empty() {
-                    // Debounce 취소
-                    state.send_debounce_command(DebounceCommand::Cancel);
-
                     if let Some(callback) = state.on_convert.lock().unwrap().as_ref() {
-                        callback(buffer_content);
+                        callback(buffer_content, true); // 수동 단축키
                     }
                 }
 
@@ -523,7 +579,7 @@ fn handle_event(
 
                     if !buffer_content.is_empty() {
                         if let Some(callback) = state.on_convert.lock().unwrap().as_ref() {
-                            callback(buffer_content);
+                            callback(buffer_content, false); // 자동 감지
                         }
                     }
 
@@ -590,7 +646,7 @@ fn handle_event(
                                     c
                                 );
                                 if let Some(callback) = state.on_convert.lock().unwrap().as_ref() {
-                                    callback(buffer_before);
+                                    callback(buffer_before, false); // 실시간 즉시
                                 }
                             }
                         }
