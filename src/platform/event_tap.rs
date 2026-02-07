@@ -239,6 +239,10 @@ pub struct EventTapState {
     pub conversion_history: Mutex<Option<ConversionHistory>>,
     /// 텍스트 교체 중 여부 (레이스 컨디션 방지)
     pub is_replacing: AtomicBool,
+    /// debounce/실시간 변환이 버퍼를 소비한 직후 true로 설정.
+    /// Space/Enter가 뒤따라 올 때 이벤트를 소비하여 race condition 방지.
+    /// 새 문자 입력 시 false로 리셋.
+    conversion_just_triggered: AtomicBool,
     /// 변환 감지 debounce 시간 (ms)
     pub debounce_ms: AtomicU64,
     /// 한글 자판 전환 지연 시간 (ms)
@@ -262,6 +266,7 @@ impl EventTapState {
             last_key_time: AtomicU64::new(0),
             conversion_history: Mutex::new(None),
             is_replacing: AtomicBool::new(false),
+            conversion_just_triggered: AtomicBool::new(false),
             debounce_ms: AtomicU64::new(300),
             switch_delay_ms: AtomicU64::new(0),
             tap_port: AtomicPtr::new(std::ptr::null_mut()),
@@ -522,6 +527,9 @@ fn trigger_realtime_conversion(state: &EventTapState) {
         };
 
         if !buffer_content.is_empty() {
+            state
+                .conversion_just_triggered
+                .store(true, Ordering::SeqCst);
             log::info!("[실시간] 변환 트리거: '{}'", buffer_content);
             if let Some(callback) = state.on_convert.lock().unwrap().as_ref() {
                 callback(buffer_content, false); // 실시간 debounce
@@ -669,6 +677,15 @@ fn handle_event(
                 // Debounce 취소 (한글 전환 타이머는 유지 — Space는 단어 경계이므로)
                 state.send_debounce_command(DebounceCommand::Cancel);
 
+                // debounce가 직전에 버퍼를 소비했다면 Space/Enter 소비
+                if state
+                    .conversion_just_triggered
+                    .swap(false, Ordering::SeqCst)
+                {
+                    state.buffer.lock().unwrap().clear();
+                    return None;
+                }
+
                 let should_convert = {
                     let buffer = state.buffer.lock().unwrap();
                     let detector = state.auto_detector.lock().unwrap();
@@ -713,6 +730,9 @@ fn handle_event(
                 // 한글 키인지 확인
                 let is_hangul = is_hangul_key(c);
 
+                state
+                    .conversion_just_triggered
+                    .store(false, Ordering::SeqCst);
                 state.buffer.lock().unwrap().push(c);
 
                 // 타이핑 중이므로 한글 전환 타이머 취소
@@ -751,6 +771,9 @@ fn handle_event(
                                     buffer.push(c); // 비한글 키는 버퍼에 남김
                                 }
 
+                                state
+                                    .conversion_just_triggered
+                                    .store(true, Ordering::SeqCst);
                                 log::info!(
                                     "[실시간-즉시] 변환 트리거: '{}' (비한글 키: '{}')",
                                     buffer_before,
