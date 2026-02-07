@@ -80,7 +80,6 @@ unsafe fn set_debounce(ms: u64) {
     if let Err(e) = save_config(&config) {
         log::error!("설정 저장 실패: {}", e);
     }
-    log::info!("변환 속도 변경: {}ms", ms);
 }
 
 unsafe fn set_switch(ms: u64) {
@@ -95,7 +94,6 @@ unsafe fn set_switch(ms: u64) {
     if let Err(e) = save_config(&config) {
         log::error!("설정 저장 실패: {}", e);
     }
-    log::info!("자판 전환 변경: {}ms", ms);
 }
 
 // --- ObjC 액션 핸들러 ---

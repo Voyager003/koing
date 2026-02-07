@@ -427,7 +427,6 @@ fn start_debounce_timer(state: Arc<EventTapState>) {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    log::info!("Debounce 타이머 스레드 종료");
                     break;
                 }
             }
@@ -460,7 +459,6 @@ fn start_switch_timer(state: Arc<EventTapState>) {
                 Ok(SwitchCommand::Reset) => {
                     if switch_fired {
                         // 이미 한글 전환 완료 상태 — 중복 Reset 무시
-                        log::info!("[SwitchTimer] 이미 전환됨, Reset 무시");
                     } else {
                         last_reset = Instant::now();
                     }
@@ -478,10 +476,6 @@ fn start_switch_timer(state: Arc<EventTapState>) {
                     }
                     let switch_delay = Duration::from_millis(switch_delay_ms);
                     if !switch_fired && last_reset.elapsed() >= switch_delay {
-                        log::info!(
-                            "[SwitchTimer] {}ms 경과, 한글 입력 소스로 전환",
-                            switch_delay.as_millis()
-                        );
                         if let Err(e) = switch_to_korean() {
                             log::warn!("[SwitchTimer] 한글 전환 실패: {}", e);
                         }
@@ -490,7 +484,6 @@ fn start_switch_timer(state: Arc<EventTapState>) {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    log::info!("한글 전환 타이머 스레드 종료");
                     break;
                 }
             }
@@ -530,7 +523,6 @@ fn trigger_realtime_conversion(state: &EventTapState) {
             state
                 .conversion_just_triggered
                 .store(true, Ordering::SeqCst);
-            log::info!("[실시간] 변환 트리거: '{}'", buffer_content);
             if let Some(callback) = state.on_convert.lock().unwrap().as_ref() {
                 callback(buffer_content, false); // 실시간 debounce
             }
@@ -571,8 +563,6 @@ pub fn start_event_tap(state: Arc<EventTapState>) -> Result<(), String> {
         CFRunLoop::get_current().add_source(&loop_source, kCFRunLoopCommonModes);
 
         tap.enable();
-
-        log::info!("Event tap 시작됨");
 
         // 메인 런루프 실행 (블로킹)
         CFRunLoop::run_current();
@@ -619,11 +609,6 @@ fn handle_event(
             if keycode == 6 && option_pressed {
                 // 6 = Z key
                 if let Some(history) = state.take_conversion_history() {
-                    log::info!(
-                        "[Undo] '{}' → '{}'",
-                        history.converted,
-                        history.original
-                    );
                     // Undo 콜백 호출 (원본 텍스트로 복원)
                     if let Some(callback) = state.on_undo.lock().unwrap().as_ref() {
                         callback(history.converted, history.original);
@@ -774,11 +759,6 @@ fn handle_event(
                                 state
                                     .conversion_just_triggered
                                     .store(true, Ordering::SeqCst);
-                                log::info!(
-                                    "[실시간-즉시] 변환 트리거: '{}' (비한글 키: '{}')",
-                                    buffer_before,
-                                    c
-                                );
                                 if let Some(callback) = state.on_convert.lock().unwrap().as_ref() {
                                     callback(buffer_before, false); // 실시간 즉시
                                 }
