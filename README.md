@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="resources/icon.jpg" width="128" alt="Koing">
+</p>
+
 # Koing (코잉)
 
 macOS 한영 자동변환 유틸리티. 영문 모드에서 한글을 잘못 입력하면 자동으로 변환합니다.
