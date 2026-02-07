@@ -143,7 +143,8 @@ fn get_cached_korean_source() -> Option<TISInputSourceRef> {
 
                 let source_id = CFString::wrap_under_get_rule(source_id_ref as CFStringRef);
                 if source_id.to_string() == KOREAN_INPUT_SOURCE_ID {
-                    // 소유권 유지를 위해 Retain
+                    // 의도적 CFRetain: 앱 수명 동안 캐싱하며 CFRelease하지 않음.
+                    // ~64바이트 고정 할당으로 실질적 리크 영향 없음.
                     CFRetain(source_ptr as CFTypeRef);
                     found = source_ptr as usize;
                     break;

@@ -193,7 +193,7 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
 
     // 6. 클립보드 복원 (앱이 붙여넣기를 완료할 때까지 충분한 딜레이)
     // 느린 앱(Electron 등)도 붙여넣기를 완료할 수 있도록 1500ms 대기
-    thread::sleep(Duration::from_millis(1500));
+    thread::sleep(Duration::from_millis(500));
     backup.restore();
 
     Ok(())
@@ -239,7 +239,7 @@ pub fn undo_replace_text(hangul_text: &str, original_text: &str) -> Result<(), S
 
     // 6. 클립보드 복원
     // 느린 앱(Electron 등)도 붙여넣기를 완료할 수 있도록 1500ms 대기
-    thread::sleep(Duration::from_millis(1500));
+    thread::sleep(Duration::from_millis(500));
     backup.restore();
 
     Ok(())

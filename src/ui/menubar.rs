@@ -13,7 +13,7 @@ use objc::declare::ClassDecl;
 use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 메뉴바 앱 상태
 pub struct MenuBarApp {
@@ -21,12 +21,20 @@ pub struct MenuBarApp {
     running: Arc<AtomicBool>,
 }
 
-// 전역 상태 포인터 (ObjC 콜백에서 접근용)
-static mut SHOULD_QUIT: bool = false;
-static mut EVENT_STATE_PTR: *const EventTapState = std::ptr::null();
+/// ObjC id wrapper for Send/Sync (all access is on the main thread via ObjC callbacks)
+#[derive(Clone, Copy)]
+struct SendId(id);
+unsafe impl Send for SendId {}
+unsafe impl Sync for SendId {}
 
-// --- 변환 속도 (debounce) ---
-static mut DEBOUNCE_MENU_ITEMS: [id; 4] = [0 as id; 4];
+impl SendId {
+    const NULL: Self = SendId(0 as id);
+}
+
+// 전역 상태 (ObjC 콜백에서 접근용) — static mut 제거
+static SHOULD_QUIT: AtomicBool = AtomicBool::new(false);
+static EVENT_STATE: OnceLock<Arc<EventTapState>> = OnceLock::new();
+static DEBOUNCE_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
 const DEBOUNCE_PRESETS: [u64; 4] = [200, 300, 500, 800];
 const DEBOUNCE_LABELS: [&str; 4] = [
     "빠름 (200ms)",
@@ -36,7 +44,7 @@ const DEBOUNCE_LABELS: [&str; 4] = [
 ];
 
 // --- 자판 전환 (switch) ---
-static mut SWITCH_MENU_ITEMS: [id; 4] = [0 as id; 4];
+static SWITCH_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
 const SWITCH_PRESETS: [u64; 4] = [0, 10, 30, 50];
 const SWITCH_LABELS: [&str; 4] = [
     "즉시 (0ms)",
@@ -46,35 +54,33 @@ const SWITCH_LABELS: [&str; 4] = [
 ];
 
 /// 현재 설정 읽어서 KoingConfig 구성
-unsafe fn current_config() -> KoingConfig {
-    if EVENT_STATE_PTR.is_null() {
-        return KoingConfig::default();
-    }
-    let state = &*EVENT_STATE_PTR;
-    KoingConfig {
-        debounce_ms: state.get_debounce_ms(),
-        switch_delay_ms: state.get_switch_delay_ms(),
+fn current_config() -> KoingConfig {
+    match EVENT_STATE.get() {
+        Some(state) => {
+            let mut config = KoingConfig::default();
+            config.debounce_ms = state.get_debounce_ms();
+            config.switch_delay_ms = state.get_switch_delay_ms();
+            config
+        }
+        None => KoingConfig::default(),
     }
 }
 
-unsafe fn update_checkmarks(items: *const [id; 4], presets: &[u64; 4], selected: u64) {
-    let items = &*items;
+fn update_checkmarks(menu_items: &Mutex<[SendId; 4]>, presets: &[u64; 4], selected: u64) {
+    let items = menu_items.lock().unwrap_or_else(|e| e.into_inner());
     for (i, &preset) in presets.iter().enumerate() {
-        let item = items[i];
+        let item = items[i].0;
         if !item.is_null() {
             let s: cocoa::foundation::NSInteger = if preset == selected { 1 } else { 0 };
-            let _: () = msg_send![item, setState: s];
+            unsafe { let _: () = msg_send![item, setState: s]; }
         }
     }
 }
 
-unsafe fn set_debounce(ms: u64) {
-    if EVENT_STATE_PTR.is_null() {
-        return;
-    }
-    let state = &*EVENT_STATE_PTR;
+fn set_debounce(ms: u64) {
+    let Some(state) = EVENT_STATE.get() else { return };
     state.set_debounce_ms(ms);
-    update_checkmarks(&raw const DEBOUNCE_MENU_ITEMS, &DEBOUNCE_PRESETS, ms);
+    update_checkmarks(&DEBOUNCE_MENU_ITEMS, &DEBOUNCE_PRESETS, ms);
 
     let config = current_config();
     if let Err(e) = save_config(&config) {
@@ -82,13 +88,10 @@ unsafe fn set_debounce(ms: u64) {
     }
 }
 
-unsafe fn set_switch(ms: u64) {
-    if EVENT_STATE_PTR.is_null() {
-        return;
-    }
-    let state = &*EVENT_STATE_PTR;
+fn set_switch(ms: u64) {
+    let Some(state) = EVENT_STATE.get() else { return };
     state.set_switch_delay_ms(ms);
-    update_checkmarks(&raw const SWITCH_MENU_ITEMS, &SWITCH_PRESETS, ms);
+    update_checkmarks(&SWITCH_MENU_ITEMS, &SWITCH_PRESETS, ms);
 
     let config = current_config();
     if let Err(e) = save_config(&config) {
@@ -99,22 +102,26 @@ unsafe fn set_switch(ms: u64) {
 // --- ObjC 액션 핸들러 ---
 
 extern "C" fn quit_action(_this: &Object, _cmd: Sel, _sender: id) {
+    SHOULD_QUIT.store(true, Ordering::Release);
+    // 이벤트 탭 CFRunLoop 정지
+    if let Some(state) = EVENT_STATE.get() {
+        state.stop();
+    }
     unsafe {
-        SHOULD_QUIT = true;
         let app: id = NSApp();
         let _: () = msg_send![app, terminate: nil];
     }
 }
 
-extern "C" fn set_debounce_200(_: &Object, _: Sel, _: id) { unsafe { set_debounce(200) }; }
-extern "C" fn set_debounce_300(_: &Object, _: Sel, _: id) { unsafe { set_debounce(300) }; }
-extern "C" fn set_debounce_500(_: &Object, _: Sel, _: id) { unsafe { set_debounce(500) }; }
-extern "C" fn set_debounce_800(_: &Object, _: Sel, _: id) { unsafe { set_debounce(800) }; }
+extern "C" fn set_debounce_200(_: &Object, _: Sel, _: id) { set_debounce(200); }
+extern "C" fn set_debounce_300(_: &Object, _: Sel, _: id) { set_debounce(300); }
+extern "C" fn set_debounce_500(_: &Object, _: Sel, _: id) { set_debounce(500); }
+extern "C" fn set_debounce_800(_: &Object, _: Sel, _: id) { set_debounce(800); }
 
-extern "C" fn set_switch_0(_: &Object, _: Sel, _: id)    { unsafe { set_switch(0) }; }
-extern "C" fn set_switch_10(_: &Object, _: Sel, _: id)   { unsafe { set_switch(10) }; }
-extern "C" fn set_switch_30(_: &Object, _: Sel, _: id)   { unsafe { set_switch(30) }; }
-extern "C" fn set_switch_50(_: &Object, _: Sel, _: id)   { unsafe { set_switch(50) }; }
+extern "C" fn set_switch_0(_: &Object, _: Sel, _: id)    { set_switch(0); }
+extern "C" fn set_switch_10(_: &Object, _: Sel, _: id)   { set_switch(10); }
+extern "C" fn set_switch_30(_: &Object, _: Sel, _: id)   { set_switch(30); }
+extern "C" fn set_switch_50(_: &Object, _: Sel, _: id)   { set_switch(50); }
 
 fn create_app_delegate_class() -> &'static Class {
     let superclass = class!(NSObject);
@@ -144,7 +151,7 @@ unsafe fn build_submenu(
     selectors: [Sel; 4],
     presets: &[u64; 4],
     current: u64,
-    items_out: *mut [id; 4],
+    items_out: &Mutex<[SendId; 4]>,
     delegate: id,
 ) -> id {
     let menu_item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(
@@ -155,6 +162,7 @@ unsafe fn build_submenu(
     let submenu = NSMenu::new(nil).autorelease();
     let _: () = msg_send![submenu, setTitle: NSString::alloc(nil).init_str(title)];
 
+    let mut items_guard = items_out.lock().unwrap_or_else(|e| e.into_inner());
     for (i, (&label, &sel)) in labels.iter().zip(selectors.iter()).enumerate() {
         let item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(
             NSString::alloc(nil).init_str(label),
@@ -165,7 +173,7 @@ unsafe fn build_submenu(
         if presets[i] == current {
             let _: () = msg_send![item, setState: 1i64];
         }
-        (*items_out)[i] = item;
+        items_guard[i] = SendId(item);
         submenu.addItem_(item);
     }
 
@@ -175,9 +183,7 @@ unsafe fn build_submenu(
 
 impl MenuBarApp {
     pub fn new(running: Arc<AtomicBool>, event_state: Arc<EventTapState>) -> Self {
-        unsafe {
-            EVENT_STATE_PTR = Arc::as_ptr(&event_state);
-        }
+        let _ = EVENT_STATE.set(Arc::clone(&event_state));
 
         let cur_debounce = event_state.get_debounce_ms();
         let cur_switch = event_state.get_switch_delay_ms();
@@ -254,7 +260,7 @@ impl MenuBarApp {
                 ],
                 &DEBOUNCE_PRESETS,
                 cur_debounce,
-                &raw mut DEBOUNCE_MENU_ITEMS,
+                &DEBOUNCE_MENU_ITEMS,
                 delegate,
             );
             menu.addItem_(debounce_item);
@@ -271,7 +277,7 @@ impl MenuBarApp {
                 ],
                 &SWITCH_PRESETS,
                 cur_switch,
-                &raw mut SWITCH_MENU_ITEMS,
+                &SWITCH_MENU_ITEMS,
                 delegate,
             );
             menu.addItem_(switch_item);
@@ -308,7 +314,7 @@ impl MenuBarApp {
             let app = NSApp();
             app.run();
         }
-        self.running.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::Release);
     }
 }
 

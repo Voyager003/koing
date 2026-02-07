@@ -13,6 +13,9 @@ pub struct KoingConfig {
     /// 자동 변환 후 한글 자판 전환까지 대기 시간 (ms)
     #[serde(default = "default_switch_delay_ms")]
     pub switch_delay_ms: u64,
+    /// 붙여넣기 후 클립보드 복원까지 대기 시간 (ms)
+    #[serde(default = "default_paste_delay_ms")]
+    pub paste_delay_ms: u64,
 }
 
 fn default_debounce_ms() -> u64 {
@@ -23,20 +26,31 @@ fn default_switch_delay_ms() -> u64 {
     0
 }
 
+fn default_paste_delay_ms() -> u64 {
+    500
+}
+
 impl Default for KoingConfig {
     fn default() -> Self {
         Self {
             debounce_ms: default_debounce_ms(),
             switch_delay_ms: default_switch_delay_ms(),
+            paste_delay_ms: default_paste_delay_ms(),
         }
     }
 }
 
 /// 설정 파일 경로: ~/Library/Application Support/koing/config.json
 pub fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join("Library")
+    let home = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_dir())
+        .unwrap_or_else(|| {
+            // HOME 미설정이거나 유효하지 않으면 /var/tmp 폴백 (쓰기 가능, /tmp보다 안전)
+            PathBuf::from("/var/tmp")
+        });
+    home.join("Library")
         .join("Application Support")
         .join("koing")
         .join("config.json")
@@ -80,6 +94,7 @@ mod tests {
         let config = KoingConfig {
             debounce_ms: 150,
             switch_delay_ms: 50,
+            paste_delay_ms: 500,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: KoingConfig = serde_json::from_str(&json).unwrap();
