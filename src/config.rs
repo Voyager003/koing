@@ -46,14 +46,10 @@ pub fn config_path() -> PathBuf {
 pub fn load_config() -> KoingConfig {
     let path = config_path();
     match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
-            log::warn!("설정 파일 파싱 실패 (기본값 사용): {}", e);
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
             KoingConfig::default()
         }),
-        Err(_) => {
-            log::info!("설정 파일 없음, 기본값 사용: {:?}", path);
-            KoingConfig::default()
-        }
+        Err(_) => KoingConfig::default(),
     }
 }
 
@@ -65,7 +61,6 @@ pub fn save_config(config: &KoingConfig) -> Result<(), String> {
     }
     let json = serde_json::to_string_pretty(config).map_err(|e| format!("직렬화 실패: {}", e))?;
     fs::write(&path, json).map_err(|e| format!("설정 파일 저장 실패: {}", e))?;
-    log::info!("설정 저장: {:?}", path);
     Ok(())
 }
 

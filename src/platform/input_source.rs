@@ -106,7 +106,6 @@ fn switch_to_input_source(target_id: &str) -> Result<(), String> {
                 let result = TISSelectInputSource(source_ptr);
                 CFRelease(source_list as CFTypeRef);
                 if result == 0 {
-                    log::info!("입력 소스 전환 성공: {}", target_id);
                     return Ok(());
                 } else {
                     return Err(format!("TISSelectInputSource 실패: 오류 코드 {}", result));
@@ -164,7 +163,6 @@ pub fn switch_to_korean() -> Result<(), String> {
     // 이미 한글이면 전환 불필요
     if let Some(id) = get_current_input_source_id() {
         if id.contains("Korean") {
-            log::debug!("이미 한글 입력 소스입니다");
             return Ok(());
         }
     }
@@ -173,7 +171,6 @@ pub fn switch_to_korean() -> Result<(), String> {
     if let Some(source) = get_cached_korean_source() {
         let result = unsafe { TISSelectInputSource(source) };
         if result == 0 {
-            log::info!("입력 소스 전환 성공: {}", KOREAN_INPUT_SOURCE_ID);
             Ok(())
         } else {
             Err(format!("TISSelectInputSource 실패: 오류 코드 {}", result))
@@ -188,7 +185,6 @@ pub fn switch_to_korean() -> Result<(), String> {
 pub fn switch_to_english() -> Result<(), String> {
     // 이미 영문이면 전환 불필요
     if is_english_input_source() {
-        log::debug!("이미 영문 입력 소스입니다");
         return Ok(());
     }
 

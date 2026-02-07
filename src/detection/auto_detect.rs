@@ -287,9 +287,6 @@ mod tests {
         assert!(!detector.should_convert("there"));
         // "world"는 w-o-r-l-d에서 'o', 'l'이 한글 모음키라서 경계 케이스
         // threshold를 높이거나 더 정교한 감지 필요
-        let world_confidence = detector.get_confidence("world");
-        // 신뢰도가 낮으면 변환하지 않음 (현재 threshold 70)
-        println!("world confidence: {}", world_confidence);
         // "world"는 변환되면 안됨, 하지만 현재 휴리스틱으로는 경계 케이스
         // 더 강력한 영어 패턴("string", "function")으로 테스트
         assert!(!detector.should_convert("string"));

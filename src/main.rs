@@ -5,7 +5,7 @@ use koing::ngram::KoreanValidator;
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
     input_source::switch_to_korean,
-    permissions::{permission_status_string, request_accessibility_permission},
+    permissions::request_accessibility_permission,
     text_replacer::{replace_text, undo_replace_text},
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -15,14 +15,10 @@ use std::sync::Arc;
 use std::thread;
 
 fn main() {
-    // 로깅 초기화
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    println!("Koing v0.1 - macOS 한영 자동변환 프로그램");
-    println!();
+    // 로깅 초기화 (error/warn만 출력)
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     // Accessibility 권한 확인
-    println!("{}", permission_status_string());
 
     if !request_accessibility_permission(true) {
         eprintln!();
@@ -32,28 +28,10 @@ fn main() {
         eprintln!();
         eprintln!("권한을 허용한 후 앱을 다시 실행해주세요.");
 
-        // 권한 없이도 메뉴바 앱은 실행 (테스트용)
-        println!();
-        println!("메뉴바 앱만 실행합니다 (변환 기능 비활성화)...");
     }
 
     // 설정 로드
     let config = load_config();
-    log::info!(
-        "설정 로드: debounce={}ms, switch={}ms",
-        config.debounce_ms, config.switch_delay_ms
-    );
-
-    println!();
-    println!("단축키:");
-    println!("  - ⌥ Option + Space: 수동 한글 변환");
-    println!("  - ⌥ Option + Z: 마지막 변환 되돌리기 (Undo)");
-    println!();
-    println!(
-        "실시간 모드: 타이핑 후 {}ms 대기 시 자동 변환, 변환 후 {}ms 뒤 한글 자판 전환",
-        config.debounce_ms, config.switch_delay_ms
-    );
-    println!();
 
     // 앱 실행 상태
     let running = Arc::new(AtomicBool::new(true));
@@ -73,25 +51,16 @@ fn main() {
     event_state.set_convert_callback(move |buffer: String, _is_manual: bool| {
         let event_state = Arc::clone(&event_state_for_callback);
         thread::spawn(move || {
-            log::info!("변환 요청: '{}'", buffer);
-
             let validator = KoreanValidator::new();
             let result = validator.analyze(&buffer);
-            log::info!("변환 결과: '{}' -> '{}'", buffer, result.converted);
 
             if !result.should_convert {
-                log::info!(
-                    "변환 취소: '{}' → '{}' (jamo={}, unnatural={})",
-                    buffer, result.converted,
-                    result.has_incomplete_jamo, result.has_unnatural_syllables
-                );
                 return;
             }
             let hangul = result.converted;
 
             // 한 글자 변환은 오탐 가능성이 높으므로 차단 (ex: rk→가, fn→루)
             if hangul.chars().count() <= 1 {
-                log::info!("변환 취소: 한 글자 결과 ('{}' → '{}')", buffer, hangul);
                 return;
             }
 
@@ -132,7 +101,6 @@ fn main() {
     event_state.set_undo_callback(move |hangul: String, original: String| {
         let event_state = Arc::clone(&event_state_for_undo);
         thread::spawn(move || {
-            log::info!("Undo 요청: '{}' -> '{}'", hangul, original);
 
             // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)
             event_state
@@ -165,5 +133,4 @@ fn main() {
     let app = MenuBarApp::new(Arc::clone(&running), Arc::clone(&event_state));
     app.run();
 
-    println!("Koing 종료");
 }
