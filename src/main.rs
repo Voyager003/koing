@@ -89,6 +89,12 @@ fn main() {
             }
             let hangul = result.converted;
 
+            // 한 글자 변환은 오탐 가능성이 높으므로 차단 (ex: rk→가, fn→루)
+            if hangul.chars().count() <= 1 {
+                log::info!("변환 취소: 한 글자 결과 ('{}' → '{}')", buffer, hangul);
+                return;
+            }
+
             // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)
             event_state
                 .is_replacing
