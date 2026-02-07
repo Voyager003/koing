@@ -11,8 +11,16 @@ use koing::platform::{
 use std::sync::atomic::Ordering as AtomicOrdering;
 use koing::ui::menubar::MenuBarApp;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
+
+/// 워커 스레드가 처리할 작업 항목
+enum WorkItem {
+    /// 영문→한글 변환 (버퍼 내용)
+    Convert(String),
+    /// Undo (한글 텍스트, 원본 영문)
+    Undo(String, String),
+}
 
 fn main() {
     // 로깅 초기화 (error/warn만 출력)
@@ -41,82 +49,90 @@ fn main() {
     event_state.set_debounce_ms(config.debounce_ms);
     event_state.set_switch_delay_ms(config.switch_delay_ms);
 
-    // 변환 이력 저장용 Arc 클론
-    let event_state_for_callback = Arc::clone(&event_state);
+    // 워커 스레드 채널 — 변환/Undo 작업을 단일 스레드에서 직렬 처리
+    let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
+
+    let event_state_for_worker = Arc::clone(&event_state);
+    thread::spawn(move || {
+        let validator = KoreanValidator::new();
+
+        while let Ok(item) = work_rx.recv() {
+            match item {
+                WorkItem::Convert(buffer) => {
+                    let result = validator.analyze(&buffer);
+
+                    if !result.should_convert {
+                        continue;
+                    }
+                    let hangul = result.converted;
+
+                    // 한 글자 변환은 오탐 가능성이 높으므로 차단 (ex: rk→가, fn→루)
+                    if hangul.chars().count() <= 1 {
+                        continue;
+                    }
+
+                    // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)
+                    event_state_for_worker
+                        .is_replacing
+                        .store(true, AtomicOrdering::Release);
+
+                    // 한글 전환을 텍스트 교체와 동시에 시작
+                    // replace_text()는 백스페이스/붙여넣기를 keycode로 시뮬레이션하므로
+                    // 입력 소스와 무관하게 동작함
+                    thread::spawn(|| {
+                        if let Err(e) = switch_to_korean() {
+                            log::warn!("한글 전환 실패: {}", e);
+                        }
+                    });
+
+                    // 텍스트 교체 (이 동안 한글 전환도 진행됨)
+                    let backspace_count = buffer.chars().count();
+                    let replace_result = replace_text(backspace_count, &hangul);
+
+                    event_state_for_worker
+                        .is_replacing
+                        .store(false, AtomicOrdering::Release);
+
+                    if let Err(e) = replace_result {
+                        log::error!("텍스트 교체 실패: {}", e);
+                        continue;
+                    }
+
+                    // 변환 이력 저장 (Undo용)
+                    event_state_for_worker.save_conversion_history(buffer, hangul);
+                }
+                WorkItem::Undo(hangul, original) => {
+                    // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)
+                    event_state_for_worker
+                        .is_replacing
+                        .store(true, AtomicOrdering::Release);
+
+                    let result = undo_replace_text(&hangul, &original);
+
+                    event_state_for_worker
+                        .is_replacing
+                        .store(false, AtomicOrdering::Release);
+
+                    if let Err(e) = result {
+                        log::error!("Undo 텍스트 교체 실패: {}", e);
+                    }
+                }
+            }
+        }
+    });
 
     // 변환 콜백 설정
-    // 콜백은 이벤트 탭 스레드에서 호출될 수 있으므로,
-    // 블로킹 작업(replace_text)은 별도 스레드에서 실행하여
+    // 콜백은 이벤트 탭 스레드에서 호출되므로, 워커에 전송만 하여
     // 이벤트 탭이 macOS에 의해 비활성화되지 않도록 함
+    let convert_tx = work_tx.clone();
     event_state.set_convert_callback(move |buffer: String, _is_manual: bool| {
-        let event_state = Arc::clone(&event_state_for_callback);
-        thread::spawn(move || {
-            let validator = KoreanValidator::new();
-            let result = validator.analyze(&buffer);
-
-            if !result.should_convert {
-                return;
-            }
-            let hangul = result.converted;
-
-            // 한 글자 변환은 오탐 가능성이 높으므로 차단 (ex: rk→가, fn→루)
-            if hangul.chars().count() <= 1 {
-                return;
-            }
-
-            // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)
-            event_state
-                .is_replacing
-                .store(true, AtomicOrdering::SeqCst);
-
-            // 한글 전환을 텍스트 교체와 동시에 시작
-            // replace_text()는 백스페이스/붙여넣기를 keycode로 시뮬레이션하므로
-            // 입력 소스와 무관하게 동작함
-            thread::spawn(|| {
-                if let Err(e) = switch_to_korean() {
-                    log::warn!("한글 전환 실패: {}", e);
-                }
-            });
-
-            // 텍스트 교체 (이 동안 한글 전환도 진행됨)
-            let backspace_count = buffer.chars().count();
-            let result = replace_text(backspace_count, &hangul);
-
-            event_state
-                .is_replacing
-                .store(false, AtomicOrdering::SeqCst);
-
-            if let Err(e) = result {
-                log::error!("텍스트 교체 실패: {}", e);
-                return;
-            }
-
-            // 변환 이력 저장 (Undo용)
-            event_state.save_conversion_history(buffer, hangul);
-        });
+        let _ = convert_tx.send(WorkItem::Convert(buffer));
     });
 
     // Undo 콜백 설정
-    let event_state_for_undo = Arc::clone(&event_state);
+    let undo_tx = work_tx;
     event_state.set_undo_callback(move |hangul: String, original: String| {
-        let event_state = Arc::clone(&event_state_for_undo);
-        thread::spawn(move || {
-
-            // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)
-            event_state
-                .is_replacing
-                .store(true, AtomicOrdering::SeqCst);
-
-            let result = undo_replace_text(&hangul, &original);
-
-            event_state
-                .is_replacing
-                .store(false, AtomicOrdering::SeqCst);
-
-            if let Err(e) = result {
-                log::error!("Undo 텍스트 교체 실패: {}", e);
-            }
-        });
+        let _ = undo_tx.send(WorkItem::Undo(hangul, original));
     });
 
     // 이벤트 탭 스레드 시작
@@ -126,11 +142,10 @@ fn main() {
         if let Err(e) = start_event_tap(event_state_for_thread) {
             log::error!("Event tap 시작 실패: {}", e);
         }
-        running_for_thread.store(false, Ordering::SeqCst);
+        running_for_thread.store(false, Ordering::Release);
     });
 
     // 메뉴바 앱 실행 (메인 스레드에서)
     let app = MenuBarApp::new(Arc::clone(&running), Arc::clone(&event_state));
     app.run();
-
 }
