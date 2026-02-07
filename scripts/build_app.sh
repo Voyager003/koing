@@ -35,6 +35,12 @@ chmod +x "$MACOS_DIR/koing"
 # Copy Info.plist with version substitution
 sed "s/__VERSION__/${VERSION}/g" "$PROJECT_DIR/resources/Info.plist" > "$CONTENTS/Info.plist"
 
+# Copy app icon
+if [ -f "$PROJECT_DIR/resources/AppIcon.icns" ]; then
+    cp "$PROJECT_DIR/resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+    echo "==> Copied AppIcon.icns to Resources/"
+fi
+
 # Copy data directory (ngram model)
 if [ -d "$PROJECT_DIR/data" ]; then
     cp -R "$PROJECT_DIR/data" "$RESOURCES_DIR/data"
