@@ -1,5 +1,6 @@
 //! Koing - macOS 한영 자동변환 프로그램
 
+use koing::config::load_config;
 use koing::ngram::KoreanValidator;
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
@@ -36,12 +37,22 @@ fn main() {
         println!("메뉴바 앱만 실행합니다 (변환 기능 비활성화)...");
     }
 
+    // 설정 로드
+    let config = load_config();
+    log::info!(
+        "설정 로드: debounce={}ms, switch={}ms",
+        config.debounce_ms, config.switch_delay_ms
+    );
+
     println!();
     println!("단축키:");
     println!("  - ⌥ Option + Space: 수동 한글 변환");
     println!("  - ⌥ Option + Z: 마지막 변환 되돌리기 (Undo)");
     println!();
-    println!("실시간 모드: 타이핑 후 300ms 대기 시 자동 변환");
+    println!(
+        "실시간 모드: 타이핑 후 {}ms 대기 시 자동 변환, 변환 후 {}ms 뒤 한글 자판 전환",
+        config.debounce_ms, config.switch_delay_ms
+    );
     println!();
 
     // 앱 실행 상태
@@ -49,6 +60,8 @@ fn main() {
 
     // 이벤트 탭 상태
     let event_state = Arc::new(EventTapState::new(HotkeyConfig::default()));
+    event_state.set_debounce_ms(config.debounce_ms);
+    event_state.set_switch_delay_ms(config.switch_delay_ms);
 
     // 변환 이력 저장용 Arc 클론
     let event_state_for_callback = Arc::clone(&event_state);
@@ -57,7 +70,7 @@ fn main() {
     // 콜백은 이벤트 탭 스레드에서 호출될 수 있으므로,
     // 블로킹 작업(replace_text)은 별도 스레드에서 실행하여
     // 이벤트 탭이 macOS에 의해 비활성화되지 않도록 함
-    event_state.set_convert_callback(move |buffer: String, is_manual: bool| {
+    event_state.set_convert_callback(move |buffer: String, _is_manual: bool| {
         let event_state = Arc::clone(&event_state_for_callback);
         thread::spawn(move || {
             log::info!("변환 요청: '{}'", buffer);
@@ -81,7 +94,16 @@ fn main() {
                 .is_replacing
                 .store(true, AtomicOrdering::SeqCst);
 
-            // 텍스트 교체
+            // 한글 전환을 텍스트 교체와 동시에 시작
+            // replace_text()는 백스페이스/붙여넣기를 keycode로 시뮬레이션하므로
+            // 입력 소스와 무관하게 동작함
+            thread::spawn(|| {
+                if let Err(e) = switch_to_korean() {
+                    log::warn!("한글 전환 실패: {}", e);
+                }
+            });
+
+            // 텍스트 교체 (이 동안 한글 전환도 진행됨)
             let backspace_count = buffer.chars().count();
             let result = replace_text(backspace_count, &hangul);
 
@@ -96,13 +118,6 @@ fn main() {
 
             // 변환 이력 저장 (Undo용)
             event_state.save_conversion_history(buffer, hangul);
-
-            // 수동 변환 시에만 한글 입력 소스로 전환
-            if is_manual {
-                if let Err(e) = switch_to_korean() {
-                    log::warn!("한글 전환 실패: {}", e);
-                }
-            }
         });
     });
 
@@ -141,7 +156,7 @@ fn main() {
     });
 
     // 메뉴바 앱 실행 (메인 스레드에서)
-    let app = MenuBarApp::new(Arc::clone(&running));
+    let app = MenuBarApp::new(Arc::clone(&running), Arc::clone(&event_state));
     app.run();
 
     println!("Koing 종료");

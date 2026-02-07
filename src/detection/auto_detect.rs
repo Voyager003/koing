@@ -25,7 +25,7 @@ impl Default for AutoDetectorConfig {
         Self {
             threshold: 70.0,
             realtime_threshold: 80.0,
-            min_length: 3,
+            min_length: 2,
             debounce_ms: 500,
         }
     }
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_should_convert_short_buffer() {
         let detector = AutoDetector::with_defaults();
-        assert!(!detector.should_convert("rk")); // 너무 짧음
+        assert!(!detector.should_convert("r")); // 1글자는 너무 짧음
     }
 
     #[test]
@@ -353,8 +353,8 @@ mod tests {
     fn test_realtime_short_buffer() {
         let detector = AutoDetector::with_defaults();
 
-        // 짧은 버퍼는 변환되지 않음
-        assert!(!detector.should_convert_realtime("rk")); // 2글자
+        // 1글자 버퍼는 변환되지 않음
+        assert!(!detector.should_convert_realtime("r")); // 1글자
     }
 
     #[test]

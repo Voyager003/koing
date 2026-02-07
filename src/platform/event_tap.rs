@@ -1,7 +1,7 @@
 //! CGEventTap을 사용한 키보드 이벤트 감지
 
 use crate::detection::AutoDetector;
-use crate::platform::input_source::is_english_input_source;
+use crate::platform::input_source::{is_english_input_source, switch_to_korean};
 use crate::platform::text_replacer::KOING_SYNTHETIC_EVENT_MARKER;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
@@ -77,6 +77,15 @@ pub enum DebounceCommand {
     Cancel,
     /// 즉시 트리거 (비한글 키 입력 시)
     Trigger,
+}
+
+/// 한글 전환 타이머 명령
+#[derive(Debug)]
+pub enum SwitchCommand {
+    /// 타이머 시작/리셋 (자동 변환 후)
+    Reset,
+    /// 타이머 취소 (새 키 입력 시)
+    Cancel,
 }
 
 /// 변환 이력 (Undo용)
@@ -222,12 +231,18 @@ pub struct EventTapState {
     pub realtime_mode: AtomicBool,
     /// Debounce 타이머 채널
     pub debounce_tx: Mutex<Option<Sender<DebounceCommand>>>,
+    /// 한글 전환 타이머 채널
+    pub switch_tx: Mutex<Option<Sender<SwitchCommand>>>,
     /// 마지막 키 입력 시간 (ms 단위 epoch)
     pub last_key_time: AtomicU64,
     /// 변환 이력 (Undo용)
     pub conversion_history: Mutex<Option<ConversionHistory>>,
     /// 텍스트 교체 중 여부 (레이스 컨디션 방지)
     pub is_replacing: AtomicBool,
+    /// 변환 감지 debounce 시간 (ms)
+    pub debounce_ms: AtomicU64,
+    /// 한글 자판 전환 지연 시간 (ms)
+    pub switch_delay_ms: AtomicU64,
     /// CGEventTap mach port (이벤트 탭 재활성화용)
     tap_port: AtomicPtr<std::ffi::c_void>,
 }
@@ -243,9 +258,12 @@ impl EventTapState {
             on_undo: Mutex::new(None),
             realtime_mode: AtomicBool::new(true), // 기본 활성화
             debounce_tx: Mutex::new(None),
+            switch_tx: Mutex::new(None),
             last_key_time: AtomicU64::new(0),
             conversion_history: Mutex::new(None),
             is_replacing: AtomicBool::new(false),
+            debounce_ms: AtomicU64::new(300),
+            switch_delay_ms: AtomicU64::new(0),
             tap_port: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
@@ -291,9 +309,38 @@ impl EventTapState {
         self.realtime_mode.load(Ordering::SeqCst)
     }
 
+    /// 변환 감지 debounce 시간 설정
+    pub fn set_debounce_ms(&self, ms: u64) {
+        self.debounce_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// 변환 감지 debounce 시간 읽기
+    pub fn get_debounce_ms(&self) -> u64 {
+        self.debounce_ms.load(Ordering::SeqCst)
+    }
+
+    /// 한글 자판 전환 지연 시간 설정
+    pub fn set_switch_delay_ms(&self, ms: u64) {
+        self.switch_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// 한글 자판 전환 지연 시간 읽기
+    pub fn get_switch_delay_ms(&self) -> u64 {
+        self.switch_delay_ms.load(Ordering::SeqCst)
+    }
+
     /// Debounce 타이머에 명령 전송
     fn send_debounce_command(&self, cmd: DebounceCommand) {
         if let Ok(tx_guard) = self.debounce_tx.lock() {
+            if let Some(ref tx) = *tx_guard {
+                let _ = tx.send(cmd);
+            }
+        }
+    }
+
+    /// 한글 전환 타이머에 명령 전송
+    pub fn send_switch_command(&self, cmd: SwitchCommand) {
+        if let Ok(tx_guard) = self.switch_tx.lock() {
             if let Some(ref tx) = *tx_guard {
                 let _ = tx.send(cmd);
             }
@@ -350,13 +397,6 @@ fn start_debounce_timer(state: Arc<EventTapState>) {
 
     thread::spawn(move || {
         let mut last_reset = Instant::now();
-        let debounce_duration = {
-            state_for_timer
-                .auto_detector
-                .lock()
-                .map(|d| Duration::from_millis(d.debounce_ms()))
-                .unwrap_or(Duration::from_millis(300))
-        };
 
         loop {
             // 타임아웃 대기
@@ -365,24 +405,87 @@ fn start_debounce_timer(state: Arc<EventTapState>) {
                     last_reset = Instant::now();
                 }
                 Ok(DebounceCommand::Cancel) => {
-                    // 타이머 리셋 (실제로 아무것도 하지 않음, 그냥 무시)
                     last_reset = Instant::now() + Duration::from_secs(3600); // 먼 미래로
                 }
                 Ok(DebounceCommand::Trigger) => {
                     // 즉시 트리거
                     trigger_realtime_conversion(&state_for_timer);
-                    last_reset = Instant::now() + Duration::from_secs(3600); // 리셋
+                    last_reset = Instant::now() + Duration::from_secs(3600);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // 타임아웃 체크
+                    let debounce_duration = Duration::from_millis(
+                        state_for_timer.debounce_ms.load(Ordering::SeqCst),
+                    );
                     if last_reset.elapsed() >= debounce_duration {
-                        // debounce 시간 경과 → 변환 체크
                         trigger_realtime_conversion(&state_for_timer);
-                        last_reset = Instant::now() + Duration::from_secs(3600); // 리셋
+                        last_reset = Instant::now() + Duration::from_secs(3600);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     log::info!("Debounce 타이머 스레드 종료");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// 한글 전환 타이머 스레드 시작
+/// 자동 변환 후 500ms간 추가 입력이 없으면 한글 입력 소스로 전환
+fn start_switch_timer(state: Arc<EventTapState>) {
+    let (tx, rx) = mpsc::channel::<SwitchCommand>();
+
+    // 채널 설정
+    {
+        let mut tx_guard = state.switch_tx.lock().unwrap();
+        *tx_guard = Some(tx);
+    }
+
+    let state_for_timer = Arc::clone(&state);
+
+    thread::spawn(move || {
+        // 초기 상태: 비활성 (먼 미래)
+        let mut last_reset = Instant::now() + Duration::from_secs(3600);
+        // 한글 전환이 이미 실행된 상태인지 추적
+        // true이면 추가 Reset을 무시하여 이중 전환 방지
+        let mut switch_fired = false;
+
+        loop {
+            match rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(SwitchCommand::Reset) => {
+                    if switch_fired {
+                        // 이미 한글 전환 완료 상태 — 중복 Reset 무시
+                        log::info!("[SwitchTimer] 이미 전환됨, Reset 무시");
+                    } else {
+                        last_reset = Instant::now();
+                    }
+                }
+                Ok(SwitchCommand::Cancel) => {
+                    last_reset = Instant::now() + Duration::from_secs(3600);
+                    // 새 타이핑 시작 → 다음 변환 사이클에서 전환 허용
+                    switch_fired = false;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let switch_delay_ms = state_for_timer.switch_delay_ms.load(Ordering::SeqCst);
+                    if switch_delay_ms == 0 {
+                        // 0ms는 main.rs에서 직접 전환 — 타이머 불필요
+                        continue;
+                    }
+                    let switch_delay = Duration::from_millis(switch_delay_ms);
+                    if !switch_fired && last_reset.elapsed() >= switch_delay {
+                        log::info!(
+                            "[SwitchTimer] {}ms 경과, 한글 입력 소스로 전환",
+                            switch_delay.as_millis()
+                        );
+                        if let Err(e) = switch_to_korean() {
+                            log::warn!("[SwitchTimer] 한글 전환 실패: {}", e);
+                        }
+                        last_reset = Instant::now() + Duration::from_secs(3600);
+                        switch_fired = true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    log::info!("한글 전환 타이머 스레드 종료");
                     break;
                 }
             }
@@ -432,6 +535,8 @@ fn trigger_realtime_conversion(state: &EventTapState) {
 pub fn start_event_tap(state: Arc<EventTapState>) -> Result<(), String> {
     // Debounce 타이머 시작
     start_debounce_timer(Arc::clone(&state));
+    // 한글 전환 타이머 시작
+    start_switch_timer(Arc::clone(&state));
 
     let state_clone = Arc::clone(&state);
 
@@ -525,8 +630,9 @@ fn handle_event(
                 && state.hotkey.require_option
                 && option_pressed
             {
-                // Debounce 먼저 취소하여 실시간 변환과의 레이스 방지
+                // Debounce 및 한글 전환 타이머 취소 (수동 전환이므로 즉시 전환됨)
                 state.send_debounce_command(DebounceCommand::Cancel);
+                state.send_switch_command(SwitchCommand::Cancel);
 
                 // 변환 트리거
                 let buffer_content = {
@@ -553,13 +659,14 @@ fn handle_event(
             if matches!(keycode, 48 | 53 | 123..=126) {
                 state.buffer.lock().unwrap().clear();
                 state.send_debounce_command(DebounceCommand::Cancel);
+                state.send_switch_command(SwitchCommand::Cancel);
                 return Some(event.clone());
             }
 
             // Space 또는 Enter 입력 시 자동 감지 체크
             if keycode == 49 || keycode == 36 {
                 // 49 = Space, 36 = Enter
-                // Debounce 취소
+                // Debounce 취소 (한글 전환 타이머는 유지 — Space는 단어 경계이므로)
                 state.send_debounce_command(DebounceCommand::Cancel);
 
                 let should_convert = {
@@ -599,6 +706,7 @@ fn handle_event(
                     // 한글 입력 모드: 버퍼 클리어하고 패스스루
                     state.buffer.lock().unwrap().clear();
                     state.send_debounce_command(DebounceCommand::Cancel);
+                    state.send_switch_command(SwitchCommand::Cancel);
                     return Some(event.clone());
                 }
 
@@ -606,6 +714,9 @@ fn handle_event(
                 let is_hangul = is_hangul_key(c);
 
                 state.buffer.lock().unwrap().push(c);
+
+                // 타이핑 중이므로 한글 전환 타이머 취소
+                state.send_switch_command(SwitchCommand::Cancel);
 
                 // 실시간 모드에서 debounce 처리
                 if state.is_realtime_mode() {

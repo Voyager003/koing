@@ -1,3 +1,4 @@
+pub mod config;
 pub mod core;
 pub mod detection;
 pub mod ngram;
