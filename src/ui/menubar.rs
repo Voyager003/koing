@@ -7,8 +7,8 @@ use cocoa::appkit::{
     NSApp, NSApplication, NSApplicationActivationPolicyAccessory, NSMenu, NSMenuItem, NSStatusBar,
     NSStatusItem, NSVariableStatusItemLength,
 };
-use cocoa::base::{id, nil, selector, NO};
-use cocoa::foundation::{NSAutoreleasePool, NSString};
+use cocoa::base::{id, nil, selector, NO, YES};
+use cocoa::foundation::{NSAutoreleasePool, NSSize, NSString};
 use objc::declare::ClassDecl;
 use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
@@ -191,8 +191,31 @@ impl MenuBarApp {
             let status_bar = NSStatusBar::systemStatusBar(nil);
             let status_item = status_bar.statusItemWithLength_(NSVariableStatusItemLength);
 
-            let title = NSString::alloc(nil).init_str("코");
-            let _: () = msg_send![status_item, setTitle: title];
+            // 메뉴바 아이콘 설정 (실패 시 "코" 텍스트 폴백)
+            let icon_loaded = (|| -> bool {
+                let bundle: id = msg_send![class!(NSBundle), mainBundle];
+                let res_name = NSString::alloc(nil).init_str("menubar_icon");
+                let res_type = NSString::alloc(nil).init_str("png");
+                let path: id = msg_send![bundle, pathForResource: res_name ofType: res_type];
+                if path == nil {
+                    return false;
+                }
+                let image: id = msg_send![class!(NSImage), alloc];
+                let image: id = msg_send![image, initWithContentsOfFile: path];
+                if image == nil {
+                    return false;
+                }
+                let size = NSSize::new(18.0, 18.0);
+                let _: () = msg_send![image, setSize: size];
+                let _: () = msg_send![image, setTemplate: YES];
+                let button: id = msg_send![status_item, button];
+                let _: () = msg_send![button, setImage: image];
+                true
+            })();
+            if !icon_loaded {
+                let title = NSString::alloc(nil).init_str("코");
+                let _: () = msg_send![status_item, setTitle: title];
+            }
 
             let menu = NSMenu::new(nil).autorelease();
 
