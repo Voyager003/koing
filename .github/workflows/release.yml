@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests
+        run: cargo test --lib
+
+      - name: Build .app bundle
+        run: |
+          chmod +x scripts/build_app.sh
+          scripts/build_app.sh
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          SHA=$(shasum -a 256 "Koing-${VERSION}.zip" | awk '{print $1}')
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Koing v${{ steps.version.outputs.version }}
+          body: |
+            ## Koing v${{ steps.version.outputs.version }}
+
+            ### 설치
+            ```bash
+            brew install --cask voyager003/koing/koing
+            ```
+
+            또는 zip을 다운로드하여 `Koing.app`을 Applications 폴더로 이동하세요.
+
+            ### SHA256
+            ```
+            ${{ steps.version.outputs.sha256 }}
+            ```
+          files: Koing-${{ steps.version.outputs.version }}.zip
