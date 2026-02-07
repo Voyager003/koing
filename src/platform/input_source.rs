@@ -2,13 +2,17 @@
 //! Carbon API의 TIS (Text Input Source) 함수 사용
 
 use core_foundation::array::CFArrayRef;
-use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+use core_foundation::base::{CFRelease, CFRetain, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
 use std::ptr;
+use std::sync::OnceLock;
 
 // Carbon TIS 타입 정의
 type TISInputSourceRef = *mut std::ffi::c_void;
 type CFIndex = isize;
+
+/// 캐싱된 한글 입력 소스 (CFRetain으로 소유권 유지)
+static KOREAN_SOURCE_CACHE: OnceLock<usize> = OnceLock::new();
 
 // Carbon 프레임워크 링크
 #[link(name = "Carbon", kind = "framework")]
@@ -115,6 +119,46 @@ fn switch_to_input_source(target_id: &str) -> Result<(), String> {
     }
 }
 
+/// 한글 입력 소스 참조를 캐싱 (최초 1회만 검색)
+fn get_cached_korean_source() -> Option<TISInputSourceRef> {
+    let ptr = *KOREAN_SOURCE_CACHE.get_or_init(|| {
+        unsafe {
+            let source_list = TISCreateInputSourceList(ptr::null(), true);
+            if source_list.is_null() {
+                return 0;
+            }
+
+            let count = CFArrayGetCount(source_list);
+            let mut found: usize = 0;
+
+            for i in 0..count {
+                let source_ptr = CFArrayGetValueAtIndex(source_list, i) as TISInputSourceRef;
+                if source_ptr.is_null() {
+                    continue;
+                }
+
+                let source_id_ref = TISGetInputSourceProperty(source_ptr, kTISPropertyInputSourceID);
+                if source_id_ref.is_null() {
+                    continue;
+                }
+
+                let source_id = CFString::wrap_under_get_rule(source_id_ref as CFStringRef);
+                if source_id.to_string() == KOREAN_INPUT_SOURCE_ID {
+                    // 소유권 유지를 위해 Retain
+                    CFRetain(source_ptr as CFTypeRef);
+                    found = source_ptr as usize;
+                    break;
+                }
+            }
+
+            CFRelease(source_list as CFTypeRef);
+            found
+        }
+    });
+
+    if ptr == 0 { None } else { Some(ptr as TISInputSourceRef) }
+}
+
 /// 한글 입력 소스로 전환
 pub fn switch_to_korean() -> Result<(), String> {
     // 이미 한글이면 전환 불필요
@@ -125,7 +169,19 @@ pub fn switch_to_korean() -> Result<(), String> {
         }
     }
 
-    switch_to_input_source(KOREAN_INPUT_SOURCE_ID)
+    // 캐싱된 소스로 즉시 전환 (리스트 순회 없음)
+    if let Some(source) = get_cached_korean_source() {
+        let result = unsafe { TISSelectInputSource(source) };
+        if result == 0 {
+            log::info!("입력 소스 전환 성공: {}", KOREAN_INPUT_SOURCE_ID);
+            Ok(())
+        } else {
+            Err(format!("TISSelectInputSource 실패: 오류 코드 {}", result))
+        }
+    } else {
+        // 캐시 실패 시 폴백
+        switch_to_input_source(KOREAN_INPUT_SOURCE_ID)
+    }
 }
 
 /// 영문 입력 소스로 전환
