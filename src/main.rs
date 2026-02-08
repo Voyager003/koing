@@ -64,6 +64,7 @@ fn main() {
 
     // 이벤트 탭 상태
     let event_state = Arc::new(EventTapState::new(HotkeyConfig::default()));
+    event_state.set_enabled(config.enabled);
     event_state.set_debounce_ms(config.debounce_ms);
     event_state.set_switch_delay_ms(config.switch_delay_ms);
 

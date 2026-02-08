@@ -236,6 +236,8 @@ pub struct EventTapState {
     pub buffer: Mutex<KeyBuffer>,
     pub hotkey: HotkeyConfig,
     pub running: AtomicBool,
+    /// Koing 활성화 여부 (false이면 모든 이벤트를 그대로 통과)
+    pub enabled: AtomicBool,
     pub auto_detector: Mutex<AutoDetector>,
     pub on_convert: Mutex<Option<Box<dyn Fn(String, bool) + Send + 'static>>>,
     /// Undo 콜백 (한글 텍스트, 원본 영문 텍스트)
@@ -276,6 +278,7 @@ impl EventTapState {
             buffer: Mutex::new(KeyBuffer::new(100)),
             hotkey,
             running: AtomicBool::new(true),
+            enabled: AtomicBool::new(true),
             auto_detector: Mutex::new(AutoDetector::default()),
             on_convert: Mutex::new(None),
             on_undo: Mutex::new(None),
@@ -309,6 +312,16 @@ impl EventTapState {
     {
         let mut on_undo = lock_or_recover(&self.on_undo);
         *on_undo = Some(Box::new(callback));
+    }
+
+    /// Koing 활성화/비활성화
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Koing 활성화 여부
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
     }
 
     /// 자동 감지 활성화/비활성화
@@ -734,6 +747,11 @@ fn handle_event(
         return Some(event.clone());
     }
 
+    // Koing 비활성화 상태이면 모든 이벤트를 그대로 통과
+    if !state.is_enabled() {
+        return Some(event.clone());
+    }
+
     // 마지막 이벤트 수신 시간 업데이트 (헬스 모니터링용)
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -820,13 +838,26 @@ fn handle_event(
                 return Some(event.clone());
             }
 
-            // Space 또는 Enter 입력 시 자동 감지 체크
-            if keycode == 49 || keycode == 36 {
-                // 49 = Space, 36 = Enter
-                // Debounce 취소 (한글 전환 타이머는 유지 — Space는 단어 경계이므로)
+            // Space 입력 시: 버퍼 초기화 (변환 트리거 없이 통과)
+            if keycode == 49 {
+                state.send_debounce_command(DebounceCommand::Cancel);
+                // debounce가 직전에 버퍼를 소비했다면 Space 소비
+                if state
+                    .conversion_just_triggered
+                    .swap(false, Ordering::AcqRel)
+                {
+                    lock_or_recover(&state.buffer).clear();
+                    return None;
+                }
+                lock_or_recover(&state.buffer).clear();
+                return Some(event.clone());
+            }
+
+            // Enter 입력 시 자동 감지 체크
+            if keycode == 36 {
                 state.send_debounce_command(DebounceCommand::Cancel);
 
-                // debounce가 직전에 버퍼를 소비했다면 Space/Enter 소비
+                // debounce가 직전에 버퍼를 소비했다면 Enter 소비
                 if state
                     .conversion_just_triggered
                     .swap(false, Ordering::AcqRel)
@@ -856,7 +887,7 @@ fn handle_event(
                         }
                     }
 
-                    // 자동 변환 시 Space/Enter 이벤트를 소비 (입력되지 않음)
+                    // 자동 변환 시 Enter 이벤트를 소비 (입력되지 않음)
                     return None;
                 }
 
