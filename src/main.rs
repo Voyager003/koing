@@ -5,7 +5,8 @@ use koing::ngram::KoreanValidator;
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
     input_source::switch_to_korean,
-    permissions::request_accessibility_permission,
+    os_version::{get_macos_version, is_sonoma_or_later},
+    permissions::{request_accessibility_permission, wait_for_accessibility_permission},
     text_replacer::{replace_text, undo_replace_text},
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -13,6 +14,7 @@ use koing::ui::menubar::MenuBarApp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 
 /// 워커 스레드가 처리할 작업 항목
 enum WorkItem {
@@ -26,16 +28,32 @@ fn main() {
     // 로깅 초기화 (error/warn만 출력)
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    // Accessibility 권한 확인
+    // macOS 버전 로깅
+    let version = get_macos_version();
+    log::warn!("macOS {} 에서 실행 중", version);
 
-    if !request_accessibility_permission(true) {
+    // Accessibility 권한 확인
+    if is_sonoma_or_later() {
+        // Sonoma/Sequoia에서는 TCC DB 업데이트가 지연될 수 있으므로 폴링 대기
+        if !wait_for_accessibility_permission(Duration::from_secs(30)) {
+            eprintln!();
+            eprintln!("⚠️  Accessibility 권한이 필요합니다.");
+            eprintln!("   시스템 설정 > 개인 정보 보호 및 보안 > 손쉬운 사용");
+            eprintln!("   에서 이 앱을 허용해주세요.");
+            eprintln!();
+            eprintln!("권한이 인식되지 않는 경우 다음 명령어를 실행해보세요:");
+            eprintln!("   tccutil reset Accessibility com.koing.app");
+            eprintln!();
+            eprintln!("권한을 허용한 후 앱을 다시 실행해주세요.");
+            std::process::exit(1);
+        }
+    } else if !request_accessibility_permission(true) {
         eprintln!();
         eprintln!("⚠️  Accessibility 권한이 필요합니다.");
         eprintln!("   시스템 설정 > 개인 정보 보호 및 보안 > 손쉬운 사용");
         eprintln!("   에서 이 앱을 허용해주세요.");
         eprintln!();
         eprintln!("권한을 허용한 후 앱을 다시 실행해주세요.");
-
     }
 
     // 설정 로드

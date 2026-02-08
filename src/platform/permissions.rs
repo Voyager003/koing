@@ -5,6 +5,7 @@ use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
 use std::ptr;
+use std::time::Duration;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -31,6 +32,28 @@ pub fn request_accessibility_permission(prompt: bool) -> bool {
             AXIsProcessTrustedWithOptions(ptr::null())
         }
     }
+}
+
+/// Accessibility 권한이 부여될 때까지 폴링 대기
+/// Sequoia에서 TCC DB 업데이트가 지연될 수 있으므로 주기적으로 확인
+/// 반환: 권한 획득 여부
+pub fn wait_for_accessibility_permission(timeout: Duration) -> bool {
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+    // 먼저 다이얼로그와 함께 확인
+    if request_accessibility_permission(true) {
+        return true;
+    }
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        std::thread::sleep(POLL_INTERVAL);
+        if check_accessibility_permission() {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// 권한 상태를 사람이 읽을 수 있는 문자열로 반환

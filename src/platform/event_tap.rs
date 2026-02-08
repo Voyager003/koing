@@ -22,6 +22,8 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 extern "C" {
     /// macOS CoreGraphics: 이벤트 탭 활성화/비활성화
     fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+    /// macOS CoreGraphics: 이벤트 탭 활성화 상태 확인
+    fn CGEventTapIsEnabled(tap: *mut std::ffi::c_void) -> bool;
     /// macOS CoreFoundation: CFRunLoop 정지
     fn CFRunLoopStop(rl: *mut std::ffi::c_void);
 }
@@ -262,6 +264,10 @@ pub struct EventTapState {
     tap_port: AtomicPtr<std::ffi::c_void>,
     /// 이벤트 탭 스레드의 CFRunLoop (정상 종료용)
     run_loop: AtomicPtr<std::ffi::c_void>,
+    /// 재활성화 필요 플래그 (콜백에서 빠르게 반환 후 감시 스레드가 처리)
+    needs_reenable: AtomicBool,
+    /// 마지막 이벤트 수신 시간 (epoch ms, 헬스 모니터링용)
+    last_event_time: AtomicU64,
 }
 
 impl EventTapState {
@@ -284,6 +290,8 @@ impl EventTapState {
             switch_delay_ms: AtomicU64::new(0),
             tap_port: AtomicPtr::new(std::ptr::null_mut()),
             run_loop: AtomicPtr::new(std::ptr::null_mut()),
+            needs_reenable: AtomicBool::new(false),
+            last_event_time: AtomicU64::new(0),
         }
     }
 
@@ -381,15 +389,67 @@ impl EventTapState {
         self.tap_port.store(port, Ordering::Release);
     }
 
-    /// 비활성화된 이벤트 탭 재활성화
-    fn reenable_tap(&self) {
+    /// 재활성화 필요 플래그 설정 (콜백에서 호출 — 빠르게 반환)
+    fn request_reenable(&self) {
+        self.needs_reenable.store(true, Ordering::Release);
+    }
+
+    /// 재시도 + 검증 로직이 포함된 이벤트 탭 재활성화
+    /// Sonoma/Sequoia에서는 더 많은 재시도와 딜레이를 사용
+    fn reenable_tap_with_retry(&self) {
+        use crate::platform::os_version::{is_sequoia_or_later, is_sonoma_or_later};
+
         let port = self.tap_port.load(Ordering::Acquire);
-        if !port.is_null() {
+        if port.is_null() {
+            return;
+        }
+
+        let (initial_delay_ms, max_retries) = if is_sequoia_or_later() {
+            (50, 5)
+        } else if is_sonoma_or_later() {
+            (50, 3)
+        } else {
+            // Ventura 이하: 즉시 1회 시도
+            (0, 1)
+        };
+
+        for attempt in 0..max_retries {
+            let delay_ms = if attempt == 0 {
+                initial_delay_ms
+            } else {
+                // 지수 백오프: 50, 100, 200, 400, ...
+                initial_delay_ms * (1u64 << attempt)
+            };
+
+            if delay_ms > 0 {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+
             unsafe {
                 CGEventTapEnable(port, true);
             }
-            log::warn!("이벤트 탭 재활성화됨");
+
+            // 재활성화 성공 검증 (짧은 딜레이 후 확인)
+            thread::sleep(Duration::from_millis(10));
+            let enabled = unsafe { CGEventTapIsEnabled(port) };
+            if enabled {
+                log::warn!(
+                    "이벤트 탭 재활성화 성공 (시도 {}/{})",
+                    attempt + 1,
+                    max_retries
+                );
+                self.needs_reenable.store(false, Ordering::Release);
+                return;
+            }
+
+            log::warn!(
+                "이벤트 탭 재활성화 실패, 재시도 {}/{}",
+                attempt + 1,
+                max_retries
+            );
         }
+
+        log::error!("이벤트 탭 재활성화 최종 실패 ({}회 시도)", max_retries);
     }
 
     /// 변환 이력 가져오기 (Undo용)
@@ -566,6 +626,54 @@ fn trigger_realtime_conversion(state: &EventTapState) {
     }
 }
 
+/// 재활성화 감시 스레드 시작
+/// needs_reenable 플래그를 폴링하여 재활성화 수행
+fn start_reenable_watcher(state: Arc<EventTapState>) {
+    let state_for_watcher = Arc::clone(&state);
+    thread::spawn(move || {
+        while state_for_watcher.running.load(Ordering::Acquire) {
+            if state_for_watcher.needs_reenable.load(Ordering::Acquire) {
+                state_for_watcher.reenable_tap_with_retry();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+/// 이벤트 탭 헬스 모니터링 스레드 시작
+/// 60초 이상 이벤트가 없으면 자동 재활성화 시도
+fn start_health_monitor(state: Arc<EventTapState>) {
+    let state_for_monitor = Arc::clone(&state);
+    thread::spawn(move || {
+        // 초기 30초 대기 (앱 시작 직후 이벤트 없는 것은 정상)
+        thread::sleep(Duration::from_secs(30));
+
+        while state_for_monitor.running.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_secs(30));
+
+            let last = state_for_monitor.last_event_time.load(Ordering::Acquire);
+            if last == 0 {
+                // 아직 이벤트를 한 번도 받지 못함 — 스킵
+                continue;
+            }
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let elapsed_sec = (now_ms.saturating_sub(last)) / 1000;
+            if elapsed_sec >= 60 {
+                log::warn!(
+                    "헬스 모니터: {}초간 이벤트 없음, 이벤트 탭 재활성화 시도",
+                    elapsed_sec
+                );
+                state_for_monitor.request_reenable();
+            }
+        }
+    });
+}
+
 /// 이벤트 탭 시작
 /// 반환: 성공 시 EventTapState의 Arc, 실패 시 에러 메시지
 pub fn start_event_tap(state: Arc<EventTapState>) -> Result<(), String> {
@@ -573,6 +681,10 @@ pub fn start_event_tap(state: Arc<EventTapState>) -> Result<(), String> {
     start_debounce_timer(Arc::clone(&state));
     // 한글 전환 타이머 시작
     start_switch_timer(Arc::clone(&state));
+    // 재활성화 감시 스레드 시작
+    start_reenable_watcher(Arc::clone(&state));
+    // 헬스 모니터링 스레드 시작
+    start_health_monitor(Arc::clone(&state));
 
     let state_clone = Arc::clone(&state);
 
@@ -622,13 +734,21 @@ fn handle_event(
         return Some(event.clone());
     }
 
-    // macOS가 이벤트 탭을 비활성화했으면 즉시 재활성화
+    // 마지막 이벤트 수신 시간 업데이트 (헬스 모니터링용)
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    state.last_event_time.store(now_ms, Ordering::Release);
+
+    // macOS가 이벤트 탭을 비활성화했으면 재활성화 요청
+    // 콜백에서 직접 재시도하지 않고, 감시 스레드가 처리하도록 플래그만 설정
     if matches!(
         event_type,
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
         log::warn!("이벤트 탭 비활성화 감지: {:?}", event_type);
-        state.reenable_tap();
+        state.request_reenable();
         return Some(event.clone());
     }
 

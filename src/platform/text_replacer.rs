@@ -11,8 +11,63 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+use crate::platform::os_version::{is_sequoia_or_later, is_sonoma_or_later};
+
 /// Koing이 생성한 합성 이벤트를 식별하는 마커 값
 pub const KOING_SYNTHETIC_EVENT_MARKER: i64 = 0x4B4F494E47; // "KOING"
+
+/// 버전별 타이밍 프로파일
+/// Sonoma/Sequoia에서 보안 정책이 강화되어 더 긴 딜레이가 필요
+struct TimingProfile {
+    /// Backspace key down/up 사이 딜레이 (ms)
+    backspace_key_delay_ms: u64,
+    /// Paste 키 이벤트 사이 딜레이 (ms)
+    paste_key_delay_ms: u64,
+    /// Paste 완료 후 딜레이 (ms)
+    paste_finish_delay_ms: u64,
+    /// Backspace 완료 → 클립보드 복사 사이 딜레이 (ms)
+    post_backspace_delay_ms: u64,
+    /// 클립보드 복원 전 대기 (ms)
+    clipboard_restore_delay_ms: u64,
+}
+
+impl TimingProfile {
+    fn for_current_os() -> Self {
+        if is_sequoia_or_later() {
+            Self {
+                backspace_key_delay_ms: 4,
+                paste_key_delay_ms: 10,
+                paste_finish_delay_ms: 40,
+                post_backspace_delay_ms: 40,
+                clipboard_restore_delay_ms: 800,
+            }
+        } else if is_sonoma_or_later() {
+            Self {
+                backspace_key_delay_ms: 3,
+                paste_key_delay_ms: 8,
+                paste_finish_delay_ms: 30,
+                post_backspace_delay_ms: 30,
+                clipboard_restore_delay_ms: 600,
+            }
+        } else {
+            // Ventura 이하: 기존 값 유지
+            Self {
+                backspace_key_delay_ms: 2,
+                paste_key_delay_ms: 5,
+                paste_finish_delay_ms: 20,
+                post_backspace_delay_ms: 20,
+                clipboard_restore_delay_ms: 500,
+            }
+        }
+    }
+}
+
+/// 캐싱된 타이밍 프로파일 (앱 수명 동안 1회만 생성)
+static TIMING: std::sync::OnceLock<TimingProfile> = std::sync::OnceLock::new();
+
+fn timing() -> &'static TimingProfile {
+    TIMING.get_or_init(TimingProfile::for_current_os)
+}
 
 lazy_static::lazy_static! {
     /// 클립보드 작업 직렬화를 위한 글로벌 Mutex
@@ -107,9 +162,19 @@ fn wait_for_clipboard(expected: &str, max_wait_ms: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// 현재 OS 버전에 적합한 이벤트 소스 상태 ID 반환
+/// Sequoia에서는 HIDSystemState가 더 안정적
+fn event_source_state_id() -> CGEventSourceStateID {
+    if is_sequoia_or_later() {
+        CGEventSourceStateID::HIDSystemState
+    } else {
+        CGEventSourceStateID::Private
+    }
+}
+
 /// 키 이벤트 시뮬레이션
 fn simulate_key(keycode: CGKeyCode, key_down: bool, flags: CGEventFlags) -> Result<(), String> {
-    let source = CGEventSource::new(CGEventSourceStateID::Private)
+    let source = CGEventSource::new(event_source_state_id())
         .map_err(|_| "CGEventSource 생성 실패")?;
 
     let event =
@@ -124,34 +189,36 @@ fn simulate_key(keycode: CGKeyCode, key_down: bool, flags: CGEventFlags) -> Resu
 
 /// Backspace 키 시뮬레이션
 fn simulate_backspace() -> Result<(), String> {
+    let t = timing();
     const BACKSPACE_KEYCODE: CGKeyCode = 51;
     simulate_key(BACKSPACE_KEYCODE, true, CGEventFlags::empty())?;
-    thread::sleep(Duration::from_millis(2));
+    thread::sleep(Duration::from_millis(t.backspace_key_delay_ms));
     simulate_key(BACKSPACE_KEYCODE, false, CGEventFlags::empty())?;
-    thread::sleep(Duration::from_millis(2));
+    thread::sleep(Duration::from_millis(t.backspace_key_delay_ms));
     Ok(())
 }
 
 /// Cmd+V (붙여넣기) 시뮬레이션
 fn simulate_paste() -> Result<(), String> {
+    let t = timing();
     const V_KEYCODE: CGKeyCode = 9;
     const COMMAND_KEYCODE: CGKeyCode = 55; // Left Command
 
     // 1. Command 키 다운
     simulate_key(COMMAND_KEYCODE, true, CGEventFlags::CGEventFlagCommand)?;
-    thread::sleep(Duration::from_millis(5));
+    thread::sleep(Duration::from_millis(t.paste_key_delay_ms));
 
     // 2. V 키 다운 (Command 플래그 포함)
     simulate_key(V_KEYCODE, true, CGEventFlags::CGEventFlagCommand)?;
-    thread::sleep(Duration::from_millis(5));
+    thread::sleep(Duration::from_millis(t.paste_key_delay_ms));
 
     // 3. V 키 업
     simulate_key(V_KEYCODE, false, CGEventFlags::CGEventFlagCommand)?;
-    thread::sleep(Duration::from_millis(5));
+    thread::sleep(Duration::from_millis(t.paste_key_delay_ms));
 
     // 4. Command 키 업
     simulate_key(COMMAND_KEYCODE, false, CGEventFlags::empty())?;
-    thread::sleep(Duration::from_millis(20));
+    thread::sleep(Duration::from_millis(t.paste_finish_delay_ms));
 
     Ok(())
 }
@@ -172,13 +239,15 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
     // 1. 클립보드 백업
     let backup = ClipboardBackup::save();
 
+    let t = timing();
+
     // 2. Backspace로 기존 텍스트 삭제
     for _ in 0..backspace_count {
         simulate_backspace()?;
     }
 
     // 약간의 딜레이 (Backspace 처리 완료 대기)
-    thread::sleep(Duration::from_millis(20));
+    thread::sleep(Duration::from_millis(t.post_backspace_delay_ms));
 
     // 3. 새 텍스트를 클립보드에 복사
     set_clipboard_string(new_text);
@@ -192,8 +261,7 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
     simulate_paste()?;
 
     // 6. 클립보드 복원 (앱이 붙여넣기를 완료할 때까지 충분한 딜레이)
-    // 느린 앱(Electron 등)도 붙여넣기를 완료할 수 있도록 1500ms 대기
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(t.clipboard_restore_delay_ms));
     backup.restore();
 
     Ok(())
@@ -218,13 +286,15 @@ pub fn undo_replace_text(hangul_text: &str, original_text: &str) -> Result<(), S
     // 1. 클립보드 백업
     let backup = ClipboardBackup::save();
 
+    let t = timing();
+
     // 2. Backspace로 한글 텍스트 삭제
     for _ in 0..backspace_count {
         simulate_backspace()?;
     }
 
     // 약간의 딜레이
-    thread::sleep(Duration::from_millis(20));
+    thread::sleep(Duration::from_millis(t.post_backspace_delay_ms));
 
     // 3. 원본 영문 텍스트를 클립보드에 복사
     set_clipboard_string(original_text);
@@ -238,8 +308,7 @@ pub fn undo_replace_text(hangul_text: &str, original_text: &str) -> Result<(), S
     simulate_paste()?;
 
     // 6. 클립보드 복원
-    // 느린 앱(Electron 등)도 붙여넣기를 완료할 수 있도록 1500ms 대기
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(t.clipboard_restore_delay_ms));
     backup.restore();
 
     Ok(())

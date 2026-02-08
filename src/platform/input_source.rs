@@ -1,11 +1,14 @@
 //! 입력 소스(한/영) 전환 기능
 //! Carbon API의 TIS (Text Input Source) 함수 사용
 
+use crate::platform::os_version::is_sonoma_or_later;
 use core_foundation::array::CFArrayRef;
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
 use std::ptr;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
 
 // Carbon TIS 타입 정의
 type TISInputSourceRef = *mut std::ffi::c_void;
@@ -13,6 +16,9 @@ type CFIndex = isize;
 
 /// 캐싱된 한글 입력 소스 (CFRetain으로 소유권 유지)
 static KOREAN_SOURCE_CACHE: OnceLock<usize> = OnceLock::new();
+
+/// 캐싱된 영문 입력 소스 (CFRetain으로 소유권 유지)
+static ENGLISH_SOURCE_CACHE: OnceLock<usize> = OnceLock::new();
 
 // Carbon 프레임워크 링크
 #[link(name = "Carbon", kind = "framework")]
@@ -66,11 +72,21 @@ pub fn get_current_input_source_id() -> Option<String> {
     }
 }
 
+/// 입력 소스 ID가 한글 입력기인지 확인
+/// macOS 기본 한글 + 서드파티 입력기(구름, 한글 등) 포함
+fn is_korean_input_source_id(id: &str) -> bool {
+    let id_lower = id.to_lowercase();
+    id_lower.contains("korean")
+        || id_lower.contains("hangul")
+        || id_lower.contains("gureum")
+        || id_lower.contains("hangeul")
+}
+
 /// 현재 영문 입력 소스인지 확인
 pub fn is_english_input_source() -> bool {
     if let Some(id) = get_current_input_source_id() {
         // 한글 입력 소스가 아니면 영문으로 간주
-        !id.contains("Korean")
+        !is_korean_input_source_id(&id)
     } else {
         // 알 수 없으면 영문으로 가정
         true
@@ -159,27 +175,110 @@ fn get_cached_korean_source() -> Option<TISInputSourceRef> {
     if ptr == 0 { None } else { Some(ptr as TISInputSourceRef) }
 }
 
+/// 입력 소스 전환 후 실제로 전환되었는지 검증 (Sonoma+ 대응)
+/// Sonoma에서 TISSelectInputSource가 비동기로 동작할 수 있음
+fn verify_switch(expected_check: impl Fn(&str) -> bool) -> bool {
+    if !is_sonoma_or_later() {
+        // Ventura 이하에서는 동기 전환이므로 검증 불필요
+        return true;
+    }
+
+    const POLL_INTERVAL_MS: u64 = 5;
+    const MAX_WAIT_MS: u64 = 50;
+    let max_tries = MAX_WAIT_MS / POLL_INTERVAL_MS;
+
+    for _ in 0..max_tries {
+        if let Some(id) = get_current_input_source_id() {
+            if expected_check(&id) {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+    }
+
+    // 마지막 확인
+    get_current_input_source_id()
+        .map(|id| expected_check(&id))
+        .unwrap_or(false)
+}
+
 /// 한글 입력 소스로 전환
 pub fn switch_to_korean() -> Result<(), String> {
     // 이미 한글이면 전환 불필요
     if let Some(id) = get_current_input_source_id() {
-        if id.contains("Korean") {
+        if is_korean_input_source_id(&id) {
             return Ok(());
         }
     }
 
     // 캐싱된 소스로 즉시 전환 (리스트 순회 없음)
-    if let Some(source) = get_cached_korean_source() {
-        let result = unsafe { TISSelectInputSource(source) };
-        if result == 0 {
+    let result = if let Some(source) = get_cached_korean_source() {
+        let ret = unsafe { TISSelectInputSource(source) };
+        if ret == 0 {
             Ok(())
         } else {
-            Err(format!("TISSelectInputSource 실패: 오류 코드 {}", result))
+            Err(format!("TISSelectInputSource 실패: 오류 코드 {}", ret))
         }
     } else {
         // 캐시 실패 시 폴백
         switch_to_input_source(KOREAN_INPUT_SOURCE_ID)
+    };
+
+    // Sonoma+에서 전환 완료 검증
+    if result.is_ok() && !verify_switch(|id| is_korean_input_source_id(id)) {
+        log::warn!("한글 전환 검증 실패 — 전환이 지연되었을 수 있음");
     }
+
+    result
+}
+
+/// 영문 입력 소스 참조를 캐싱 (최초 1회만 검색, ABC 또는 US)
+fn get_cached_english_source() -> Option<TISInputSourceRef> {
+    let ptr = *ENGLISH_SOURCE_CACHE.get_or_init(|| {
+        unsafe {
+            let source_list = TISCreateInputSourceList(ptr::null(), true);
+            if source_list.is_null() {
+                return 0;
+            }
+
+            let count = CFArrayGetCount(source_list);
+            let mut found: usize = 0;
+
+            // ABC를 우선, 없으면 US
+            let target_ids = [ENGLISH_INPUT_SOURCE_ID, ENGLISH_US_INPUT_SOURCE_ID];
+
+            for target_id in &target_ids {
+                for i in 0..count {
+                    let source_ptr = CFArrayGetValueAtIndex(source_list, i) as TISInputSourceRef;
+                    if source_ptr.is_null() {
+                        continue;
+                    }
+
+                    let source_id_ref =
+                        TISGetInputSourceProperty(source_ptr, kTISPropertyInputSourceID);
+                    if source_id_ref.is_null() {
+                        continue;
+                    }
+
+                    let source_id = CFString::wrap_under_get_rule(source_id_ref as CFStringRef);
+                    if source_id.to_string() == *target_id {
+                        CFRetain(source_ptr as CFTypeRef);
+                        found = source_ptr as usize;
+                        break;
+                    }
+                }
+
+                if found != 0 {
+                    break;
+                }
+            }
+
+            CFRelease(source_list as CFTypeRef);
+            found
+        }
+    });
+
+    if ptr == 0 { None } else { Some(ptr as TISInputSourceRef) }
 }
 
 /// 영문 입력 소스로 전환
@@ -189,9 +288,28 @@ pub fn switch_to_english() -> Result<(), String> {
         return Ok(());
     }
 
-    // ABC 먼저 시도, 실패하면 US 시도
-    switch_to_input_source(ENGLISH_INPUT_SOURCE_ID)
-        .or_else(|_| switch_to_input_source(ENGLISH_US_INPUT_SOURCE_ID))
+    // 캐싱된 소스로 즉시 전환 시도
+    let result = if let Some(source) = get_cached_english_source() {
+        let ret = unsafe { TISSelectInputSource(source) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            // 캐시된 소스 실패 시 폴백
+            switch_to_input_source(ENGLISH_INPUT_SOURCE_ID)
+                .or_else(|_| switch_to_input_source(ENGLISH_US_INPUT_SOURCE_ID))
+        }
+    } else {
+        // 캐시 실패 시 폴백
+        switch_to_input_source(ENGLISH_INPUT_SOURCE_ID)
+            .or_else(|_| switch_to_input_source(ENGLISH_US_INPUT_SOURCE_ID))
+    };
+
+    // Sonoma+에서 전환 완료 검증
+    if result.is_ok() && !verify_switch(|id| !is_korean_input_source_id(id)) {
+        log::warn!("영문 전환 검증 실패 — 전환이 지연되었을 수 있음");
+    }
+
+    result
 }
 
 #[cfg(test)]
