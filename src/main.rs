@@ -3,11 +3,13 @@
 use koing::config::load_config;
 use koing::ngram::KoreanValidator;
 use koing::platform::{
-    event_tap::{start_event_tap, EventTapState, HotkeyConfig},
-    input_source::switch_to_korean,
+    dispatch_to_main,
+    event_tap::{start_event_tap, EventTapState, HotkeyConfig, IndicatorCommand},
+    input_source::{is_english_input_source, switch_to_korean},
     os_version::{get_macos_version, is_sonoma_or_later},
     permissions::{request_accessibility_permission, wait_for_accessibility_permission},
     text_replacer::{replace_text, undo_replace_text},
+    cursor_position::{get_caret_position, get_mouse_position},
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
 use koing::ui::menubar::MenuBarApp;
@@ -67,6 +69,48 @@ fn main() {
     event_state.set_enabled(config.enabled);
     event_state.set_debounce_ms(config.debounce_ms);
     event_state.set_switch_delay_ms(config.switch_delay_ms);
+    event_state.set_slow_debounce_ms(config.slow_debounce_ms);
+
+    // 인디케이터 채널 설정
+    let (indicator_tx, indicator_rx) = mpsc::channel::<IndicatorCommand>();
+    event_state.set_indicator_tx(indicator_tx);
+
+    // 인디케이터 워커 스레드
+    thread::spawn(move || {
+        // 이전 입력 소스 상태를 여기서 관리 (FlagsChanged 딜레이 체크용)
+        let mut last_was_korean = !is_english_input_source();
+
+        while let Ok(cmd) = indicator_rx.recv() {
+            match cmd {
+                IndicatorCommand::CheckAndShow => {
+                    let is_korean = !is_english_input_source();
+                    if is_korean != last_was_korean {
+                        last_was_korean = is_korean;
+                        let pos = get_caret_position().unwrap_or_else(|| get_mouse_position());
+                        let text = if is_korean { "한" } else { "A" };
+                        let text = text.to_string();
+                        dispatch_to_main(move || {
+                            koing::ui::indicator::show_indicator(&text, pos.0, pos.1);
+                        });
+                    }
+                }
+                IndicatorCommand::Show(is_korean) => {
+                    last_was_korean = is_korean;
+                    let pos = get_caret_position().unwrap_or_else(|| get_mouse_position());
+                    let text = if is_korean { "한" } else { "A" };
+                    let text = text.to_string();
+                    dispatch_to_main(move || {
+                        koing::ui::indicator::show_indicator(&text, pos.0, pos.1);
+                    });
+                }
+                IndicatorCommand::Hide => {
+                    dispatch_to_main(|| {
+                        koing::ui::indicator::hide_indicator();
+                    });
+                }
+            }
+        }
+    });
 
     // 워커 스레드 채널 — 변환/Undo 작업을 단일 스레드에서 직렬 처리
     let (work_tx, work_rx) = mpsc::channel::<WorkItem>();

@@ -74,7 +74,7 @@ pub fn get_current_input_source_id() -> Option<String> {
 
 /// 입력 소스 ID가 한글 입력기인지 확인
 /// macOS 기본 한글 + 서드파티 입력기(구름, 한글 등) 포함
-fn is_korean_input_source_id(id: &str) -> bool {
+pub(crate) fn is_korean_input_source_id(id: &str) -> bool {
     let id_lower = id.to_lowercase();
     id_lower.contains("korean")
         || id_lower.contains("hangul")

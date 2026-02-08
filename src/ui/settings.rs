@@ -31,6 +31,10 @@ const DEBOUNCE_LABELS: [&str; 4] = ["빠름 (200ms)", "보통 (300ms)", "느림 
 const SWITCH_PRESETS: [u64; 4] = [0, 10, 30, 50];
 const SWITCH_LABELS: [&str; 4] = ["즉시 (0ms)", "빠름 (10ms)", "보통 (30ms)", "느림 (50ms)"];
 
+// 느린 변환 프리셋
+const SLOW_DEBOUNCE_PRESETS: [u64; 4] = [1000, 1500, 2000, 3000];
+const SLOW_DEBOUNCE_LABELS: [&str; 4] = ["빠름 (1초)", "보통 (1.5초)", "느림 (2초)", "여유 (3초)"];
+
 // --- ObjC 액션 핸들러 ---
 
 extern "C" fn toggle_enabled_action(_: &Object, _: Sel, sender: id) {
@@ -83,6 +87,22 @@ extern "C" fn switch_changed(_: &Object, _: Sel, sender: id) {
     }
 }
 
+extern "C" fn slow_debounce_changed(_: &Object, _: Sel, sender: id) {
+    let Some(state) = EVENT_STATE.get() else { return };
+    unsafe {
+        let index: cocoa::foundation::NSInteger = msg_send![sender, indexOfSelectedItem];
+        if (index as usize) < SLOW_DEBOUNCE_PRESETS.len() {
+            let ms = SLOW_DEBOUNCE_PRESETS[index as usize];
+            state.set_slow_debounce_ms(ms);
+
+            let config = current_config();
+            if let Err(e) = save_config(&config) {
+                log::error!("설정 저장 실패: {}", e);
+            }
+        }
+    }
+}
+
 fn get_delegate_class() -> &'static Class {
     SETTINGS_DELEGATE_CLASS.get_or_init(|| {
         let superclass = class!(NSObject);
@@ -94,6 +114,7 @@ fn get_delegate_class() -> &'static Class {
                     decl.add_method(sel!(toggleEnabled:), toggle_enabled_action as ActionFn);
                     decl.add_method(sel!(debounceChanged:), debounce_changed as ActionFn);
                     decl.add_method(sel!(switchChanged:), switch_changed as ActionFn);
+                    decl.add_method(sel!(slowDebounceChanged:), slow_debounce_changed as ActionFn);
                 }
 
                 decl.register()
@@ -139,7 +160,7 @@ pub fn show_settings_window() {
         }
 
         // 윈도우 생성
-        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 280.0));
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 330.0));
         let style = NSWindowStyleMask::NSTitledWindowMask
             | NSWindowStyleMask::NSClosableWindowMask;
         let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
@@ -157,7 +178,7 @@ pub fn show_settings_window() {
         // --- "Koing 활성화" 체크박스 ---
         let checkbox = create_checkbox(
             "Koing 활성화",
-            NSRect::new(NSPoint::new(30.0, 210.0), NSSize::new(200.0, 24.0)),
+            NSRect::new(NSPoint::new(30.0, 260.0), NSSize::new(200.0, 24.0)),
             config.enabled,
             delegate,
             sel!(toggleEnabled:),
@@ -166,36 +187,52 @@ pub fn show_settings_window() {
 
         // --- 구분선 ---
         let separator = create_separator(
-            NSRect::new(NSPoint::new(20.0, 195.0), NSSize::new(360.0, 1.0)),
+            NSRect::new(NSPoint::new(20.0, 245.0), NSSize::new(360.0, 1.0)),
         );
         let _: () = msg_send![content_view, addSubview: separator];
 
         // --- "변환 속도" 라벨 + 팝업 버튼 ---
         let debounce_label = create_label(
             "변환 속도",
-            NSRect::new(NSPoint::new(30.0, 155.0), NSSize::new(120.0, 20.0)),
+            NSRect::new(NSPoint::new(30.0, 205.0), NSSize::new(120.0, 20.0)),
         );
         let _: () = msg_send![content_view, addSubview: debounce_label];
 
         let debounce_popup = create_popup_button(
             &DEBOUNCE_LABELS,
-            NSRect::new(NSPoint::new(160.0, 152.0), NSSize::new(200.0, 26.0)),
+            NSRect::new(NSPoint::new(160.0, 202.0), NSSize::new(200.0, 26.0)),
             DEBOUNCE_PRESETS.iter().position(|&v| v == config.debounce_ms).unwrap_or(1),
             delegate,
             sel!(debounceChanged:),
         );
         let _: () = msg_send![content_view, addSubview: debounce_popup];
 
+        // --- "느린 변환 속도" 라벨 + 팝업 버튼 ---
+        let slow_debounce_label = create_label(
+            "느린 변환 속도",
+            NSRect::new(NSPoint::new(30.0, 160.0), NSSize::new(120.0, 20.0)),
+        );
+        let _: () = msg_send![content_view, addSubview: slow_debounce_label];
+
+        let slow_debounce_popup = create_popup_button(
+            &SLOW_DEBOUNCE_LABELS,
+            NSRect::new(NSPoint::new(160.0, 157.0), NSSize::new(200.0, 26.0)),
+            SLOW_DEBOUNCE_PRESETS.iter().position(|&v| v == config.slow_debounce_ms).unwrap_or(1),
+            delegate,
+            sel!(slowDebounceChanged:),
+        );
+        let _: () = msg_send![content_view, addSubview: slow_debounce_popup];
+
         // --- "자판 전환 지연" 라벨 + 팝업 버튼 ---
         let switch_label = create_label(
             "자판 전환 지연",
-            NSRect::new(NSPoint::new(30.0, 110.0), NSSize::new(120.0, 20.0)),
+            NSRect::new(NSPoint::new(30.0, 115.0), NSSize::new(120.0, 20.0)),
         );
         let _: () = msg_send![content_view, addSubview: switch_label];
 
         let switch_popup = create_popup_button(
             &SWITCH_LABELS,
-            NSRect::new(NSPoint::new(160.0, 107.0), NSSize::new(200.0, 26.0)),
+            NSRect::new(NSPoint::new(160.0, 112.0), NSSize::new(200.0, 26.0)),
             SWITCH_PRESETS.iter().position(|&v| v == config.switch_delay_ms).unwrap_or(0),
             delegate,
             sel!(switchChanged:),

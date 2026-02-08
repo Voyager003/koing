@@ -60,6 +60,16 @@ const SWITCH_LABELS: [&str; 4] = [
     "느림 (50ms)",
 ];
 
+// --- 느린 변환 (slow debounce) ---
+static SLOW_DEBOUNCE_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
+const SLOW_DEBOUNCE_PRESETS: [u64; 4] = [1000, 1500, 2000, 3000];
+const SLOW_DEBOUNCE_LABELS: [&str; 4] = [
+    "빠름 (1초)",
+    "보통 (1.5초)",
+    "느림 (2초)",
+    "여유 (3초)",
+];
+
 /// 현재 설정 읽어서 KoingConfig 구성
 pub fn current_config() -> KoingConfig {
     match EVENT_STATE.get() {
@@ -68,6 +78,7 @@ pub fn current_config() -> KoingConfig {
             config.enabled = state.is_enabled();
             config.debounce_ms = state.get_debounce_ms();
             config.switch_delay_ms = state.get_switch_delay_ms();
+            config.slow_debounce_ms = state.get_slow_debounce_ms();
             config
         }
         None => KoingConfig::default(),
@@ -107,6 +118,17 @@ fn set_switch(ms: u64) {
     }
 }
 
+fn set_slow_debounce(ms: u64) {
+    let Some(state) = EVENT_STATE.get() else { return };
+    state.set_slow_debounce_ms(ms);
+    update_checkmarks(&SLOW_DEBOUNCE_MENU_ITEMS, &SLOW_DEBOUNCE_PRESETS, ms);
+
+    let config = current_config();
+    if let Err(e) = save_config(&config) {
+        log::error!("설정 저장 실패: {}", e);
+    }
+}
+
 // --- ObjC 액션 핸들러 ---
 
 extern "C" fn quit_action(_this: &Object, _cmd: Sel, _sender: id) {
@@ -130,6 +152,11 @@ extern "C" fn set_switch_0(_: &Object, _: Sel, _: id)    { set_switch(0); }
 extern "C" fn set_switch_10(_: &Object, _: Sel, _: id)   { set_switch(10); }
 extern "C" fn set_switch_30(_: &Object, _: Sel, _: id)   { set_switch(30); }
 extern "C" fn set_switch_50(_: &Object, _: Sel, _: id)   { set_switch(50); }
+
+extern "C" fn set_slow_debounce_1000(_: &Object, _: Sel, _: id) { set_slow_debounce(1000); }
+extern "C" fn set_slow_debounce_1500(_: &Object, _: Sel, _: id) { set_slow_debounce(1500); }
+extern "C" fn set_slow_debounce_2000(_: &Object, _: Sel, _: id) { set_slow_debounce(2000); }
+extern "C" fn set_slow_debounce_3000(_: &Object, _: Sel, _: id) { set_slow_debounce(3000); }
 
 extern "C" fn toggle_enabled(_: &Object, _: Sel, _: id) {
     let Some(state) = EVENT_STATE.get() else { return };
@@ -202,6 +229,10 @@ fn create_app_delegate_class() -> &'static Class {
         decl.add_method(sel!(setSwitch10:), set_switch_10 as ActionFn);
         decl.add_method(sel!(setSwitch30:), set_switch_30 as ActionFn);
         decl.add_method(sel!(setSwitch50:), set_switch_50 as ActionFn);
+        decl.add_method(sel!(setSlowDebounce1000:), set_slow_debounce_1000 as ActionFn);
+        decl.add_method(sel!(setSlowDebounce1500:), set_slow_debounce_1500 as ActionFn);
+        decl.add_method(sel!(setSlowDebounce2000:), set_slow_debounce_2000 as ActionFn);
+        decl.add_method(sel!(setSlowDebounce3000:), set_slow_debounce_3000 as ActionFn);
         decl.add_method(sel!(toggleEnabled:), toggle_enabled as ActionFn);
         decl.add_method(sel!(openSettings:), open_settings as ActionFn);
     }
@@ -253,6 +284,7 @@ impl MenuBarApp {
         let cur_enabled = event_state.is_enabled();
         let cur_debounce = event_state.get_debounce_ms();
         let cur_switch = event_state.get_switch_delay_ms();
+        let cur_slow_debounce = event_state.get_slow_debounce_ms();
 
         unsafe {
             let _pool = NSAutoreleasePool::new(nil);
@@ -398,6 +430,23 @@ impl MenuBarApp {
                 delegate,
             );
             menu.addItem_(switch_item);
+
+            // 느린 변환 서브메뉴
+            let slow_debounce_item = build_submenu(
+                "느린 변환",
+                &SLOW_DEBOUNCE_LABELS,
+                [
+                    sel!(setSlowDebounce1000:),
+                    sel!(setSlowDebounce1500:),
+                    sel!(setSlowDebounce2000:),
+                    sel!(setSlowDebounce3000:),
+                ],
+                &SLOW_DEBOUNCE_PRESETS,
+                cur_slow_debounce,
+                &SLOW_DEBOUNCE_MENU_ITEMS,
+                delegate,
+            );
+            menu.addItem_(slow_debounce_item);
 
             menu.addItem_(NSMenuItem::separatorItem(nil));
 
