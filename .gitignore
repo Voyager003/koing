@@ -5,3 +5,5 @@ CLAUDE.md
 /.claude
 /Koing.app
 /Koing-*.zip
+.DS_Store
+koing-0.2.0-arm64.tar.gz
