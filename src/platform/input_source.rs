@@ -6,9 +6,21 @@ use core_foundation::array::CFArrayRef;
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+
+/// 캐싱된 입력 소스 상태 (true = 영문)
+static INPUT_SOURCE_IS_ENGLISH: AtomicBool = AtomicBool::new(true);
+/// 캐시 유효 여부
+static INPUT_SOURCE_CACHE_VALID: AtomicBool = AtomicBool::new(false);
+
+/// 입력 소스 캐시 무효화
+/// FlagsChanged, switch_to_korean(), switch_to_english() 완료 후 호출
+pub fn invalidate_input_source_cache() {
+    INPUT_SOURCE_CACHE_VALID.store(false, Ordering::Release);
+}
 
 // Carbon TIS 타입 정의
 type TISInputSourceRef = *mut std::ffi::c_void;
@@ -72,25 +84,45 @@ pub fn get_current_input_source_id() -> Option<String> {
     }
 }
 
-/// 입력 소스 ID가 한글 입력기인지 확인
-/// macOS 기본 한글 + 서드파티 입력기(구름, 한글 등) 포함
-pub(crate) fn is_korean_input_source_id(id: &str) -> bool {
-    let id_lower = id.to_lowercase();
-    id_lower.contains("korean")
-        || id_lower.contains("hangul")
-        || id_lower.contains("gureum")
-        || id_lower.contains("hangeul")
+/// ASCII case-insensitive substring 검사 (String 할당 없음)
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle_bytes.len())
+        .any(|window| window.eq_ignore_ascii_case(needle_bytes))
 }
 
-/// 현재 영문 입력 소스인지 확인
+/// 입력 소스 ID가 한글 입력기인지 확인
+/// macOS 기본 한글 + 서드파티 입력기(구름, 한글 등) 포함
+/// ASCII case-insensitive 비교로 String 할당 없이 검사
+pub(crate) fn is_korean_input_source_id(id: &str) -> bool {
+    contains_ascii_case_insensitive(id, "korean")
+        || contains_ascii_case_insensitive(id, "hangul")
+        || contains_ascii_case_insensitive(id, "gureum")
+        || contains_ascii_case_insensitive(id, "hangeul")
+}
+
+/// 현재 영문 입력 소스인지 확인 (캐시 활용)
 pub fn is_english_input_source() -> bool {
-    if let Some(id) = get_current_input_source_id() {
-        // 한글 입력 소스가 아니면 영문으로 간주
+    // 캐시가 유효하면 atomic 읽기만으로 즉시 반환
+    if INPUT_SOURCE_CACHE_VALID.load(Ordering::Acquire) {
+        return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
+    }
+
+    // 캐시 미스 — TIS API 호출 후 캐시 갱신
+    let is_english = if let Some(id) = get_current_input_source_id() {
         !is_korean_input_source_id(&id)
     } else {
-        // 알 수 없으면 영문으로 가정
         true
-    }
+    };
+
+    INPUT_SOURCE_IS_ENGLISH.store(is_english, Ordering::Release);
+    INPUT_SOURCE_CACHE_VALID.store(true, Ordering::Release);
+    is_english
 }
 
 /// 특정 입력 소스 ID로 전환
@@ -229,6 +261,9 @@ pub fn switch_to_korean() -> Result<(), String> {
         log::warn!("한글 전환 검증 실패 — 전환이 지연되었을 수 있음");
     }
 
+    // 전환 후 캐시 무효화
+    invalidate_input_source_cache();
+
     result
 }
 
@@ -308,6 +343,9 @@ pub fn switch_to_english() -> Result<(), String> {
     if result.is_ok() && !verify_switch(|id| !is_korean_input_source_id(id)) {
         log::warn!("영문 전환 검증 실패 — 전환이 지연되었을 수 있음");
     }
+
+    // 전환 후 캐시 무효화
+    invalidate_input_source_cache();
 
     result
 }

@@ -27,8 +27,10 @@ struct TimingProfile {
     paste_finish_delay_ms: u64,
     /// Backspace 완료 → 클립보드 복사 사이 딜레이 (ms)
     post_backspace_delay_ms: u64,
-    /// 클립보드 복원 전 대기 (ms)
+    /// 클립보드 복원 전 최대 대기 (ms) — adaptive wait의 폴백 상한
     clipboard_restore_delay_ms: u64,
+    /// Paste 후 최소 대기 시간 (ms) — changeCount 안정화 보장
+    min_paste_wait_ms: u64,
 }
 
 impl TimingProfile {
@@ -40,6 +42,7 @@ impl TimingProfile {
                 paste_finish_delay_ms: 40,
                 post_backspace_delay_ms: 40,
                 clipboard_restore_delay_ms: 800,
+                min_paste_wait_ms: 300,
             }
         } else if is_sonoma_or_later() {
             Self {
@@ -48,6 +51,7 @@ impl TimingProfile {
                 paste_finish_delay_ms: 30,
                 post_backspace_delay_ms: 30,
                 clipboard_restore_delay_ms: 600,
+                min_paste_wait_ms: 250,
             }
         } else {
             // Ventura 이하: 기존 값 유지
@@ -57,6 +61,7 @@ impl TimingProfile {
                 paste_finish_delay_ms: 20,
                 post_backspace_delay_ms: 20,
                 clipboard_restore_delay_ms: 500,
+                min_paste_wait_ms: 200,
             }
         }
     }
@@ -136,6 +141,62 @@ pub fn set_clipboard_string(content: &str) {
 
         let _: () = msg_send![pasteboard, declareTypes: types owner: nil];
         let _: () = msg_send![pasteboard, setString: ns_string forType: NSString::alloc(nil).init_str("public.utf8-plain-text")];
+    }
+}
+
+/// NSPasteboard의 changeCount 가져오기
+/// changeCount는 클립보드에 쓰기할 때만 증가 (읽기 시 불변)
+fn get_pasteboard_change_count() -> i64 {
+    unsafe {
+        let pasteboard: id = NSPasteboard::generalPasteboard(nil);
+        msg_send![pasteboard, changeCount]
+    }
+}
+
+/// Paste 후 클립보드 복원 안전 대기
+/// - min_paste_wait_ms로 대상 앱이 Cmd+V를 처리하고 클립보드를 읽을 시간 보장
+/// - changeCount는 외부 프로세스의 클립보드 쓰기 감지용 (paste는 읽기이므로 count 불변)
+/// - pre_paste_count: simulate_paste() 호출 전에 기록한 changeCount
+/// - max_wait_ms: 최대 대기 시간 (폴백)
+/// - 반환: true이면 복원 안전, false이면 외부 변경 감지 (복원 건너뜀)
+fn wait_for_paste_completion(pre_paste_count: i64, max_wait_ms: u64) -> bool {
+    let t = timing();
+    let start = std::time::Instant::now();
+
+    // 최소 대기: 앱이 Cmd+V를 처리하고 클립보드를 읽을 시간 보장
+    // paste는 클립보드 읽기이므로 changeCount로는 완료 감지 불가
+    thread::sleep(Duration::from_millis(t.min_paste_wait_ms));
+
+    // changeCount로 외부 변경 감지 (5ms 간격, 3회 연속 동일하면 안전)
+    let mut stable_count = 0u32;
+    let max_deadline = Duration::from_millis(max_wait_ms);
+
+    loop {
+        if start.elapsed() >= max_deadline {
+            // 최대 대기 시간 초과 — 폴백으로 복원 진행
+            log::warn!("paste 완료 대기 타임아웃 ({}ms), 폴백 복원", max_wait_ms);
+            return true;
+        }
+
+        let current_count = get_pasteboard_change_count();
+
+        if current_count != pre_paste_count {
+            // 외부 프로세스가 클립보드를 변경함 — 복원 건너뜀
+            log::warn!(
+                "클립보드 외부 변경 감지 (count: {} → {}), 복원 건너뜀",
+                pre_paste_count,
+                current_count
+            );
+            return false;
+        }
+
+        stable_count += 1;
+        if stable_count >= 3 {
+            // 3회 연속 동일 → 앱이 paste를 완료하고 클립보드를 건드리지 않음
+            return true;
+        }
+
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -257,12 +318,16 @@ pub fn replace_text(backspace_count: usize, new_text: &str) -> Result<(), String
         log::warn!("클립보드 설정 확인 실패, 계속 진행");
     }
 
-    // 5. Cmd+V로 붙여넣기
+    // 5. paste 전 changeCount 기록
+    let pre_paste_count = get_pasteboard_change_count();
+
+    // 6. Cmd+V로 붙여넣기
     simulate_paste()?;
 
-    // 6. 클립보드 복원 (앱이 붙여넣기를 완료할 때까지 충분한 딜레이)
-    thread::sleep(Duration::from_millis(t.clipboard_restore_delay_ms));
-    backup.restore();
+    // 7. 클립보드 복원 (adaptive changeCount 대기)
+    if wait_for_paste_completion(pre_paste_count, t.clipboard_restore_delay_ms) {
+        backup.restore();
+    }
 
     Ok(())
 }
@@ -304,12 +369,16 @@ pub fn undo_replace_text(hangul_text: &str, original_text: &str) -> Result<(), S
         log::warn!("클립보드 설정 확인 실패, 계속 진행");
     }
 
-    // 5. Cmd+V로 붙여넣기
+    // 5. paste 전 changeCount 기록
+    let pre_paste_count = get_pasteboard_change_count();
+
+    // 6. Cmd+V로 붙여넣기
     simulate_paste()?;
 
-    // 6. 클립보드 복원
-    thread::sleep(Duration::from_millis(t.clipboard_restore_delay_ms));
-    backup.restore();
+    // 7. 클립보드 복원 (adaptive changeCount 대기)
+    if wait_for_paste_completion(pre_paste_count, t.clipboard_restore_delay_ms) {
+        backup.restore();
+    }
 
     Ok(())
 }

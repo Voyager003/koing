@@ -79,9 +79,45 @@ fn main() {
     thread::spawn(move || {
         // 이전 입력 소스 상태를 여기서 관리 (FlagsChanged 딜레이 체크용)
         let mut last_was_korean = !is_english_input_source();
+        // DebouncedCheck 대기 중인지 여부
+        let mut debounce_pending = false;
 
-        while let Ok(cmd) = indicator_rx.recv() {
+        loop {
+            let cmd = if debounce_pending {
+                // DebouncedCheck 대기 중 — 100ms 타임아웃으로 디바운싱
+                match indicator_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(cmd) => Some(cmd),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // 100ms 동안 추가 DebouncedCheck 없음 → 실제 체크 실행
+                        debounce_pending = false;
+                        let is_korean = !is_english_input_source();
+                        if is_korean != last_was_korean {
+                            last_was_korean = is_korean;
+                            let pos = get_caret_position().unwrap_or_else(|| get_mouse_position());
+                            let text = if is_korean { "한" } else { "A" };
+                            let text = text.to_string();
+                            dispatch_to_main(move || {
+                                koing::ui::indicator::show_indicator(&text, pos.0, pos.1);
+                            });
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match indicator_rx.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => break,
+                }
+            };
+
+            let Some(cmd) = cmd else { break };
+
             match cmd {
+                IndicatorCommand::DebouncedCheck => {
+                    // latest-wins: 연속 DebouncedCheck는 타이머만 리셋
+                    debounce_pending = true;
+                }
                 IndicatorCommand::CheckAndShow => {
                     let is_korean = !is_english_input_source();
                     if is_korean != last_was_korean {
