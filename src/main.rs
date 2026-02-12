@@ -3,7 +3,8 @@
 use koing::config::load_config;
 use koing::ngram::KoreanValidator;
 use koing::platform::{
-    event_tap::{start_event_tap, EventTapState, HotkeyConfig, SwitchCommand},
+    event_tap::{start_event_tap, EventTapState, HotkeyConfig},
+    input_source::switch_to_korean,
     os_version::{get_macos_version, is_sonoma_or_later},
     permissions::{request_accessibility_permission, wait_for_accessibility_permission},
     text_replacer::{replace_text, undo_replace_text},
@@ -95,25 +96,31 @@ fn main() {
                         .is_replacing
                         .store(true, AtomicOrdering::Release);
 
-                    // 텍스트 교체 (한글 전환은 교체 후 switch 타이머로 지연 처리)
                     let backspace_count = buffer.chars().count();
                     let replace_result = replace_text(backspace_count, &hangul);
+
+                    if let Err(e) = replace_result {
+                        event_state_for_worker
+                            .is_replacing
+                            .store(false, AtomicOrdering::Release);
+                        log::error!("텍스트 교체 실패: {}", e);
+                        continue;
+                    }
+
+                    // paste 처리 완료 대기 (is_replacing=true 유지하여 이벤트 탭 간섭 차단)
+                    thread::sleep(Duration::from_millis(200));
+
+                    // 한글 자판 전환 (is_replacing=true 상태에서 수행)
+                    if let Err(e) = switch_to_korean() {
+                        log::warn!("한글 전환 실패: {}", e);
+                    }
 
                     event_state_for_worker
                         .is_replacing
                         .store(false, AtomicOrdering::Release);
 
-                    if let Err(e) = replace_result {
-                        log::error!("텍스트 교체 실패: {}", e);
-                        continue;
-                    }
-
                     // 변환 이력 저장 (Undo용)
                     event_state_for_worker.save_conversion_history(buffer, hangul);
-
-                    // 한글 전환 타이머 시작 (타이핑 중이면 Cancel로 취소됨)
-                    event_state_for_worker
-                        .send_switch_command(SwitchCommand::Reset);
                 }
                 WorkItem::Undo(hangul, original) => {
                     // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)
