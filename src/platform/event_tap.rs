@@ -652,18 +652,12 @@ fn start_switch_timer(state: Arc<EventTapState>) {
 
                 let remaining = if let Some(reset_time) = deadline {
                     let switch_delay_ms = state_for_timer.switch_delay_ms.load(Ordering::Relaxed);
-                    if switch_delay_ms == 0 {
-                        // 0ms는 main.rs에서 직접 전환 — 타이머 불필요
-                        deadline = None;
-                        Duration::from_secs(3600)
-                    } else {
-                        let target = Duration::from_millis(switch_delay_ms);
-                        let elapsed = reset_time.elapsed();
-                        if elapsed >= target {
-                            break;
-                        }
-                        target - elapsed
+                    let target = Duration::from_millis(switch_delay_ms);
+                    let elapsed = reset_time.elapsed();
+                    if elapsed >= target {
+                        break;
                     }
+                    target - elapsed
                 } else {
                     Duration::from_secs(3600)
                 };
