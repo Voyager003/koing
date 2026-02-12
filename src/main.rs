@@ -3,13 +3,10 @@
 use koing::config::load_config;
 use koing::ngram::KoreanValidator;
 use koing::platform::{
-    dispatch_to_main,
-    event_tap::{start_event_tap, EventTapState, HotkeyConfig, IndicatorCommand},
-    input_source::{is_english_input_source, switch_to_korean},
+    event_tap::{start_event_tap, EventTapState, HotkeyConfig, SwitchCommand},
     os_version::{get_macos_version, is_sonoma_or_later},
     permissions::{request_accessibility_permission, wait_for_accessibility_permission},
     text_replacer::{replace_text, undo_replace_text},
-    cursor_position::{get_caret_position, get_mouse_position},
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
 use koing::ui::menubar::MenuBarApp;
@@ -71,83 +68,6 @@ fn main() {
     event_state.set_switch_delay_ms(config.switch_delay_ms);
     event_state.set_slow_debounce_ms(config.slow_debounce_ms);
 
-    // 인디케이터 채널 설정
-    let (indicator_tx, indicator_rx) = mpsc::channel::<IndicatorCommand>();
-    event_state.set_indicator_tx(indicator_tx);
-
-    // 인디케이터 워커 스레드
-    thread::spawn(move || {
-        // 이전 입력 소스 상태를 여기서 관리 (FlagsChanged 딜레이 체크용)
-        let mut last_was_korean = !is_english_input_source();
-        // DebouncedCheck 대기 중인지 여부
-        let mut debounce_pending = false;
-
-        loop {
-            let cmd = if debounce_pending {
-                // DebouncedCheck 대기 중 — 100ms 타임아웃으로 디바운싱
-                match indicator_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(cmd) => Some(cmd),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        // 100ms 동안 추가 DebouncedCheck 없음 → 실제 체크 실행
-                        debounce_pending = false;
-                        let is_korean = !is_english_input_source();
-                        if is_korean != last_was_korean {
-                            last_was_korean = is_korean;
-                            let pos = get_caret_position().unwrap_or_else(|| get_mouse_position());
-                            let text = if is_korean { "한" } else { "A" };
-                            let text = text.to_string();
-                            dispatch_to_main(move || {
-                                koing::ui::indicator::show_indicator(&text, pos.0, pos.1);
-                            });
-                        }
-                        continue;
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            } else {
-                match indicator_rx.recv() {
-                    Ok(cmd) => Some(cmd),
-                    Err(_) => break,
-                }
-            };
-
-            let Some(cmd) = cmd else { break };
-
-            match cmd {
-                IndicatorCommand::DebouncedCheck => {
-                    // latest-wins: 연속 DebouncedCheck는 타이머만 리셋
-                    debounce_pending = true;
-                }
-                IndicatorCommand::CheckAndShow => {
-                    let is_korean = !is_english_input_source();
-                    if is_korean != last_was_korean {
-                        last_was_korean = is_korean;
-                        let pos = get_caret_position().unwrap_or_else(|| get_mouse_position());
-                        let text = if is_korean { "한" } else { "A" };
-                        let text = text.to_string();
-                        dispatch_to_main(move || {
-                            koing::ui::indicator::show_indicator(&text, pos.0, pos.1);
-                        });
-                    }
-                }
-                IndicatorCommand::Show(is_korean) => {
-                    last_was_korean = is_korean;
-                    let pos = get_caret_position().unwrap_or_else(|| get_mouse_position());
-                    let text = if is_korean { "한" } else { "A" };
-                    let text = text.to_string();
-                    dispatch_to_main(move || {
-                        koing::ui::indicator::show_indicator(&text, pos.0, pos.1);
-                    });
-                }
-                IndicatorCommand::Hide => {
-                    dispatch_to_main(|| {
-                        koing::ui::indicator::hide_indicator();
-                    });
-                }
-            }
-        }
-    });
-
     // 워커 스레드 채널 — 변환/Undo 작업을 단일 스레드에서 직렬 처리
     let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
 
@@ -175,16 +95,7 @@ fn main() {
                         .is_replacing
                         .store(true, AtomicOrdering::Release);
 
-                    // 한글 전환을 텍스트 교체와 동시에 시작
-                    // replace_text()는 백스페이스/붙여넣기를 keycode로 시뮬레이션하므로
-                    // 입력 소스와 무관하게 동작함
-                    thread::spawn(|| {
-                        if let Err(e) = switch_to_korean() {
-                            log::warn!("한글 전환 실패: {}", e);
-                        }
-                    });
-
-                    // 텍스트 교체 (이 동안 한글 전환도 진행됨)
+                    // 텍스트 교체 (한글 전환은 교체 후 switch 타이머로 지연 처리)
                     let backspace_count = buffer.chars().count();
                     let replace_result = replace_text(backspace_count, &hangul);
 
@@ -199,6 +110,10 @@ fn main() {
 
                     // 변환 이력 저장 (Undo용)
                     event_state_for_worker.save_conversion_history(buffer, hangul);
+
+                    // 한글 전환 타이머 시작 (타이핑 중이면 Cancel로 취소됨)
+                    event_state_for_worker
+                        .send_switch_command(SwitchCommand::Reset);
                 }
                 WorkItem::Undo(hangul, original) => {
                     // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)

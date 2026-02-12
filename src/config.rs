@@ -33,7 +33,7 @@ fn default_debounce_ms() -> u64 {
 }
 
 fn default_switch_delay_ms() -> u64 {
-    0
+    1500
 }
 
 fn default_paste_delay_ms() -> u64 {
@@ -102,7 +102,7 @@ mod tests {
     fn test_default_config() {
         let config = KoingConfig::default();
         assert_eq!(config.debounce_ms, 300);
-        assert_eq!(config.switch_delay_ms, 0);
+        assert_eq!(config.switch_delay_ms, 1500);
     }
 
     #[test]

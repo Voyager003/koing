@@ -9,7 +9,6 @@ use core_graphics::event::{
     CGEventType, EventField,
 };
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -109,19 +108,6 @@ struct DebounceTimerState {
 /// Condvar 기반 switch 타이머 상태
 struct SwitchTimerState {
     command: Option<SwitchCommand>,
-}
-
-/// 입력 소스 인디케이터 명령
-#[derive(Debug)]
-pub enum IndicatorCommand {
-    /// 인디케이터 표시 (true=한글, false=영문)
-    Show(bool),
-    /// 인디케이터 숨기기
-    Hide,
-    /// 입력 소스 체크 후 변경 시 표시 (FlagsChanged 딜레이 후 호출)
-    CheckAndShow,
-    /// 디바운스된 입력 소스 체크 (FlagsChanged에서 전송, 워커에서 100ms 디바운싱)
-    DebouncedCheck,
 }
 
 /// 변환 이력 (Undo용)
@@ -285,8 +271,6 @@ pub struct EventTapState {
     pub debounce_ms: AtomicU64,
     /// 한글 자판 전환 지연 시간 (ms)
     pub switch_delay_ms: AtomicU64,
-    /// 인디케이터 명령 채널
-    pub indicator_tx: Mutex<Option<Sender<IndicatorCommand>>>,
     /// 느린 변환 대기 시간 (ms) — 유효하지만 확신 낮은 한글용
     pub slow_debounce_ms: AtomicU64,
     /// CGEventTap mach port (이벤트 탭 재활성화용)
@@ -322,7 +306,6 @@ impl EventTapState {
             conversion_history: Mutex::new(None),
             is_replacing: AtomicBool::new(false),
             conversion_just_triggered: AtomicBool::new(false),
-            indicator_tx: Mutex::new(None),
             slow_debounce_ms: AtomicU64::new(1500),
             debounce_ms: AtomicU64::new(300),
             switch_delay_ms: AtomicU64::new(0),
@@ -429,21 +412,6 @@ impl EventTapState {
         if let Ok(mut state) = mutex.lock() {
             state.command = Some(cmd);
             cvar.notify_one();
-        }
-    }
-
-    /// 인디케이터 명령 채널 설정
-    pub fn set_indicator_tx(&self, tx: Sender<IndicatorCommand>) {
-        let mut guard = lock_or_recover(&self.indicator_tx);
-        *guard = Some(tx);
-    }
-
-    /// 인디케이터 명령 전송
-    fn send_indicator_command(&self, cmd: IndicatorCommand) {
-        if let Ok(tx_guard) = self.indicator_tx.lock() {
-            if let Some(ref tx) = *tx_guard {
-                let _ = tx.send(cmd);
-            }
         }
     }
 
@@ -668,9 +636,8 @@ fn start_switch_timer(state: Arc<EventTapState>) {
                 if let Some(cmd) = guard.command.take() {
                     match cmd {
                         SwitchCommand::Reset => {
-                            if !switch_fired {
-                                deadline = Some(Instant::now());
-                            }
+                            deadline = Some(Instant::now());
+                            switch_fired = false;
                         }
                         SwitchCommand::Cancel => {
                             deadline = None;
@@ -1071,8 +1038,6 @@ fn handle_event(
 
             // 문자 키 처리 - 영문 입력 모드일 때만 버퍼링
             if let Some(c) = keycode_to_char(keycode, shift_pressed) {
-                // 문자 입력 시 인디케이터 숨기기
-                state.send_indicator_command(IndicatorCommand::Hide);
                 // 현재 입력 소스 확인 (한글 모드면 버퍼링 안함)
                 if !is_english_input_source() {
                     // 한글 입력 모드: 버퍼 클리어하고 패스스루
@@ -1143,9 +1108,6 @@ fn handle_event(
         CGEventType::FlagsChanged => {
             // 수정키 변경 시 입력 소스 캐시 무효화
             invalidate_input_source_cache();
-
-            // 입력 소스 전환은 비동기이므로, 워커 스레드에서 디바운스 후 체크
-            state.send_indicator_command(IndicatorCommand::DebouncedCheck);
 
             Some(event.clone())
         }

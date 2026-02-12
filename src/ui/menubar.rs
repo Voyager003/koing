@@ -52,12 +52,12 @@ const DEBOUNCE_LABELS: [&str; 4] = [
 
 // --- 자판 전환 (switch) ---
 static SWITCH_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
-const SWITCH_PRESETS: [u64; 4] = [0, 10, 30, 50];
+const SWITCH_PRESETS: [u64; 4] = [0, 500, 1000, 2000];
 const SWITCH_LABELS: [&str; 4] = [
-    "즉시 (0ms)",
-    "빠름 (10ms)",
-    "보통 (30ms)",
-    "느림 (50ms)",
+    "사용 안함",
+    "빠름 (0.5초)",
+    "보통 (1초)",
+    "느림 (2초)",
 ];
 
 // --- 느린 변환 (slow debounce) ---
