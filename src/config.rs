@@ -7,6 +7,9 @@ use std::path::PathBuf;
 /// Koing 설정
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct KoingConfig {
+    /// Koing 활성화 여부
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// 타이핑 멈춘 후 자동 변환까지 대기 시간 (ms)
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
@@ -16,6 +19,13 @@ pub struct KoingConfig {
     /// 붙여넣기 후 클립보드 복원까지 대기 시간 (ms)
     #[serde(default = "default_paste_delay_ms")]
     pub paste_delay_ms: u64,
+    /// 느린 변환 대기 시간 (ms) — N-gram 점수가 낮지만 유효한 한글용
+    #[serde(default = "default_slow_debounce_ms")]
+    pub slow_debounce_ms: u64,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_debounce_ms() -> u64 {
@@ -23,19 +33,25 @@ fn default_debounce_ms() -> u64 {
 }
 
 fn default_switch_delay_ms() -> u64 {
-    0
+    1500
 }
 
 fn default_paste_delay_ms() -> u64 {
     500
 }
 
+fn default_slow_debounce_ms() -> u64 {
+    1500
+}
+
 impl Default for KoingConfig {
     fn default() -> Self {
         Self {
+            enabled: default_enabled(),
             debounce_ms: default_debounce_ms(),
             switch_delay_ms: default_switch_delay_ms(),
             paste_delay_ms: default_paste_delay_ms(),
+            slow_debounce_ms: default_slow_debounce_ms(),
         }
     }
 }
@@ -86,15 +102,17 @@ mod tests {
     fn test_default_config() {
         let config = KoingConfig::default();
         assert_eq!(config.debounce_ms, 300);
-        assert_eq!(config.switch_delay_ms, 0);
+        assert_eq!(config.switch_delay_ms, 1500);
     }
 
     #[test]
     fn test_serialize_deserialize() {
         let config = KoingConfig {
+            enabled: true,
             debounce_ms: 150,
             switch_delay_ms: 50,
             paste_delay_ms: 500,
+            slow_debounce_ms: 1500,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: KoingConfig = serde_json::from_str(&json).unwrap();

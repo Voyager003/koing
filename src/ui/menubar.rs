@@ -15,6 +15,9 @@ use objc::{class, msg_send, sel, sel_impl};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// 메뉴바 아이콘 데이터 (컴파일 타임 임베딩)
+const MENUBAR_ICON_DATA: &[u8] = include_bytes!("../../resources/menubar_icon.png");
+
 /// 메뉴바 앱 상태
 pub struct MenuBarApp {
     status_item: id,
@@ -33,7 +36,11 @@ impl SendId {
 
 // 전역 상태 (ObjC 콜백에서 접근용) — static mut 제거
 static SHOULD_QUIT: AtomicBool = AtomicBool::new(false);
-static EVENT_STATE: OnceLock<Arc<EventTapState>> = OnceLock::new();
+pub static EVENT_STATE: OnceLock<Arc<EventTapState>> = OnceLock::new();
+/// 메뉴바 status_item (아이콘 알파 변경용)
+static STATUS_ITEM: Mutex<SendId> = Mutex::new(SendId::NULL);
+/// "Koing 활성화" 토글 메뉴 아이템
+static TOGGLE_MENU_ITEM: Mutex<SendId> = Mutex::new(SendId::NULL);
 static DEBOUNCE_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
 const DEBOUNCE_PRESETS: [u64; 4] = [200, 300, 500, 800];
 const DEBOUNCE_LABELS: [&str; 4] = [
@@ -45,21 +52,33 @@ const DEBOUNCE_LABELS: [&str; 4] = [
 
 // --- 자판 전환 (switch) ---
 static SWITCH_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
-const SWITCH_PRESETS: [u64; 4] = [0, 10, 30, 50];
+const SWITCH_PRESETS: [u64; 4] = [0, 500, 1000, 2000];
 const SWITCH_LABELS: [&str; 4] = [
-    "즉시 (0ms)",
-    "빠름 (10ms)",
-    "보통 (30ms)",
-    "느림 (50ms)",
+    "사용 안함",
+    "빠름 (0.5초)",
+    "보통 (1초)",
+    "느림 (2초)",
+];
+
+// --- 느린 변환 (slow debounce) ---
+static SLOW_DEBOUNCE_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
+const SLOW_DEBOUNCE_PRESETS: [u64; 4] = [1000, 1500, 2000, 3000];
+const SLOW_DEBOUNCE_LABELS: [&str; 4] = [
+    "빠름 (1초)",
+    "보통 (1.5초)",
+    "느림 (2초)",
+    "여유 (3초)",
 ];
 
 /// 현재 설정 읽어서 KoingConfig 구성
-fn current_config() -> KoingConfig {
+pub fn current_config() -> KoingConfig {
     match EVENT_STATE.get() {
         Some(state) => {
             let mut config = KoingConfig::default();
+            config.enabled = state.is_enabled();
             config.debounce_ms = state.get_debounce_ms();
             config.switch_delay_ms = state.get_switch_delay_ms();
+            config.slow_debounce_ms = state.get_slow_debounce_ms();
             config
         }
         None => KoingConfig::default(),
@@ -99,6 +118,17 @@ fn set_switch(ms: u64) {
     }
 }
 
+fn set_slow_debounce(ms: u64) {
+    let Some(state) = EVENT_STATE.get() else { return };
+    state.set_slow_debounce_ms(ms);
+    update_checkmarks(&SLOW_DEBOUNCE_MENU_ITEMS, &SLOW_DEBOUNCE_PRESETS, ms);
+
+    let config = current_config();
+    if let Err(e) = save_config(&config) {
+        log::error!("설정 저장 실패: {}", e);
+    }
+}
+
 // --- ObjC 액션 핸들러 ---
 
 extern "C" fn quit_action(_this: &Object, _cmd: Sel, _sender: id) {
@@ -123,6 +153,66 @@ extern "C" fn set_switch_10(_: &Object, _: Sel, _: id)   { set_switch(10); }
 extern "C" fn set_switch_30(_: &Object, _: Sel, _: id)   { set_switch(30); }
 extern "C" fn set_switch_50(_: &Object, _: Sel, _: id)   { set_switch(50); }
 
+extern "C" fn set_slow_debounce_1000(_: &Object, _: Sel, _: id) { set_slow_debounce(1000); }
+extern "C" fn set_slow_debounce_1500(_: &Object, _: Sel, _: id) { set_slow_debounce(1500); }
+extern "C" fn set_slow_debounce_2000(_: &Object, _: Sel, _: id) { set_slow_debounce(2000); }
+extern "C" fn set_slow_debounce_3000(_: &Object, _: Sel, _: id) { set_slow_debounce(3000); }
+
+extern "C" fn toggle_enabled(_: &Object, _: Sel, _: id) {
+    let Some(state) = EVENT_STATE.get() else { return };
+    let new_enabled = !state.is_enabled();
+    state.set_enabled(new_enabled);
+
+    // 토글 메뉴 아이템 체크마크 업데이트
+    let toggle_item = TOGGLE_MENU_ITEM.lock().unwrap_or_else(|e| e.into_inner());
+    if !toggle_item.0.is_null() {
+        let check: cocoa::foundation::NSInteger = if new_enabled { 1 } else { 0 };
+        unsafe { let _: () = msg_send![toggle_item.0, setState: check]; }
+    }
+
+    // 메뉴바 아이콘 알파값 변경 (비활성화 시 흐리게)
+    let status_item = STATUS_ITEM.lock().unwrap_or_else(|e| e.into_inner());
+    if !status_item.0.is_null() {
+        unsafe {
+            let button: id = msg_send![status_item.0, button];
+            if !button.is_null() {
+                let alpha: f64 = if new_enabled { 1.0 } else { 0.3 };
+                let _: () = msg_send![button, setAlphaValue: alpha];
+            }
+        }
+    }
+
+    // 설정 저장
+    let config = current_config();
+    if let Err(e) = save_config(&config) {
+        log::error!("설정 저장 실패: {}", e);
+    }
+}
+
+extern "C" fn open_settings(_: &Object, _: Sel, _: id) {
+    crate::ui::settings::show_settings_window();
+}
+
+/// 외부에서 토글 상태를 업데이트할 때 사용 (설정 윈도우에서 호출)
+pub fn update_toggle_state(enabled: bool) {
+    let toggle_item = TOGGLE_MENU_ITEM.lock().unwrap_or_else(|e| e.into_inner());
+    if !toggle_item.0.is_null() {
+        let check: cocoa::foundation::NSInteger = if enabled { 1 } else { 0 };
+        unsafe { let _: () = msg_send![toggle_item.0, setState: check]; }
+    }
+
+    let status_item = STATUS_ITEM.lock().unwrap_or_else(|e| e.into_inner());
+    if !status_item.0.is_null() {
+        unsafe {
+            let button: id = msg_send![status_item.0, button];
+            if !button.is_null() {
+                let alpha: f64 = if enabled { 1.0 } else { 0.3 };
+                let _: () = msg_send![button, setAlphaValue: alpha];
+            }
+        }
+    }
+}
+
 fn create_app_delegate_class() -> &'static Class {
     let superclass = class!(NSObject);
     let mut decl = ClassDecl::new("KoingAppDelegate", superclass).unwrap();
@@ -139,6 +229,12 @@ fn create_app_delegate_class() -> &'static Class {
         decl.add_method(sel!(setSwitch10:), set_switch_10 as ActionFn);
         decl.add_method(sel!(setSwitch30:), set_switch_30 as ActionFn);
         decl.add_method(sel!(setSwitch50:), set_switch_50 as ActionFn);
+        decl.add_method(sel!(setSlowDebounce1000:), set_slow_debounce_1000 as ActionFn);
+        decl.add_method(sel!(setSlowDebounce1500:), set_slow_debounce_1500 as ActionFn);
+        decl.add_method(sel!(setSlowDebounce2000:), set_slow_debounce_2000 as ActionFn);
+        decl.add_method(sel!(setSlowDebounce3000:), set_slow_debounce_3000 as ActionFn);
+        decl.add_method(sel!(toggleEnabled:), toggle_enabled as ActionFn);
+        decl.add_method(sel!(openSettings:), open_settings as ActionFn);
     }
 
     decl.register()
@@ -185,8 +281,10 @@ impl MenuBarApp {
     pub fn new(running: Arc<AtomicBool>, event_state: Arc<EventTapState>) -> Self {
         let _ = EVENT_STATE.set(Arc::clone(&event_state));
 
+        let cur_enabled = event_state.is_enabled();
         let cur_debounce = event_state.get_debounce_ms();
         let cur_switch = event_state.get_switch_delay_ms();
+        let cur_slow_debounce = event_state.get_slow_debounce_ms();
 
         unsafe {
             let _pool = NSAutoreleasePool::new(nil);
@@ -197,17 +295,36 @@ impl MenuBarApp {
             let status_bar = NSStatusBar::systemStatusBar(nil);
             let status_item = status_bar.statusItemWithLength_(NSVariableStatusItemLength);
 
-            // 메뉴바 아이콘 설정 (실패 시 "코" 텍스트 폴백)
+            // 메뉴바 아이콘 설정
+            // 1. NSBundle에서 로드 시도
+            // 2. 실패 시 임베딩된 PNG 데이터에서 로드
+            // 3. 최종 실패 시 "코" 텍스트 폴백
             let icon_loaded = (|| -> bool {
+                // 방법 1: NSBundle에서 리소스 로드
                 let bundle: id = msg_send![class!(NSBundle), mainBundle];
                 let res_name = NSString::alloc(nil).init_str("menubar_icon");
                 let res_type = NSString::alloc(nil).init_str("png");
                 let path: id = msg_send![bundle, pathForResource: res_name ofType: res_type];
-                if path == nil {
-                    return false;
-                }
-                let image: id = msg_send![class!(NSImage), alloc];
-                let image: id = msg_send![image, initWithContentsOfFile: path];
+                let image: id = if path != nil {
+                    let img: id = msg_send![class!(NSImage), alloc];
+                    msg_send![img, initWithContentsOfFile: path]
+                } else {
+                    nil
+                };
+
+                // 방법 2: 임베딩된 데이터에서 로드
+                let image: id = if image != nil {
+                    image
+                } else {
+                    let data: id = msg_send![class!(NSData), dataWithBytes: MENUBAR_ICON_DATA.as_ptr()
+                                                               length: MENUBAR_ICON_DATA.len()];
+                    if data == nil {
+                        return false;
+                    }
+                    let img: id = msg_send![class!(NSImage), alloc];
+                    msg_send![img, initWithData: data]
+                };
+
                 if image == nil {
                     return false;
                 }
@@ -223,14 +340,28 @@ impl MenuBarApp {
                 let _: () = msg_send![status_item, setTitle: title];
             }
 
+            // status_item을 전역 상태에 저장 (아이콘 알파 변경용)
+            {
+                let mut si = STATUS_ITEM.lock().unwrap_or_else(|e| e.into_inner());
+                *si = SendId(status_item);
+            }
+
+            // 비활성화 상태면 아이콘 흐리게 표시
+            if !cur_enabled {
+                let button: id = msg_send![status_item, button];
+                if !button.is_null() {
+                    let _: () = msg_send![button, setAlphaValue: 0.3f64];
+                }
+            }
+
             let menu = NSMenu::new(nil).autorelease();
 
             let delegate_class = create_app_delegate_class();
             let delegate: id = msg_send![delegate_class, new];
 
-            // Koing v0.1 (비활성)
+            // Koing v0.2 (비활성)
             let version_item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(
-                NSString::alloc(nil).init_str("Koing v0.1"),
+                NSString::alloc(nil).init_str("Koing v0.2"),
                 selector(""),
                 NSString::alloc(nil).init_str(""),
             );
@@ -245,6 +376,24 @@ impl MenuBarApp {
             );
             let _: () = msg_send![hotkey_item, setEnabled: NO];
             menu.addItem_(hotkey_item);
+
+            menu.addItem_(NSMenuItem::separatorItem(nil));
+
+            // "Koing 활성화" 토글 메뉴 아이템
+            let toggle_item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(
+                NSString::alloc(nil).init_str("Koing 활성화"),
+                sel!(toggleEnabled:),
+                NSString::alloc(nil).init_str(""),
+            );
+            let _: () = msg_send![toggle_item, setTarget: delegate];
+            if cur_enabled {
+                let _: () = msg_send![toggle_item, setState: 1i64];
+            }
+            {
+                let mut ti = TOGGLE_MENU_ITEM.lock().unwrap_or_else(|e| e.into_inner());
+                *ti = SendId(toggle_item);
+            }
+            menu.addItem_(toggle_item);
 
             menu.addItem_(NSMenuItem::separatorItem(nil));
 
@@ -282,7 +431,33 @@ impl MenuBarApp {
             );
             menu.addItem_(switch_item);
 
+            // 느린 변환 서브메뉴
+            let slow_debounce_item = build_submenu(
+                "느린 변환",
+                &SLOW_DEBOUNCE_LABELS,
+                [
+                    sel!(setSlowDebounce1000:),
+                    sel!(setSlowDebounce1500:),
+                    sel!(setSlowDebounce2000:),
+                    sel!(setSlowDebounce3000:),
+                ],
+                &SLOW_DEBOUNCE_PRESETS,
+                cur_slow_debounce,
+                &SLOW_DEBOUNCE_MENU_ITEMS,
+                delegate,
+            );
+            menu.addItem_(slow_debounce_item);
+
             menu.addItem_(NSMenuItem::separatorItem(nil));
+
+            // 설정...
+            let settings_item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(
+                NSString::alloc(nil).init_str("설정..."),
+                sel!(openSettings:),
+                NSString::alloc(nil).init_str(","),
+            );
+            let _: () = msg_send![settings_item, setTarget: delegate];
+            menu.addItem_(settings_item);
 
             // 종료
             let quit_item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(

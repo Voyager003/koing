@@ -1,7 +1,7 @@
 //! CGEventTap을 사용한 키보드 이벤트 감지
 
 use crate::detection::AutoDetector;
-use crate::platform::input_source::{is_english_input_source, switch_to_korean};
+use crate::platform::input_source::{invalidate_input_source_cache, is_english_input_source, switch_to_korean};
 use crate::platform::text_replacer::KOING_SYNTHETIC_EVENT_MARKER;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
@@ -9,7 +9,6 @@ use core_graphics::event::{
     CGEventType, EventField,
 };
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,8 +21,39 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 extern "C" {
     /// macOS CoreGraphics: 이벤트 탭 활성화/비활성화
     fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+    /// macOS CoreGraphics: 이벤트 탭 활성화 상태 확인
+    fn CGEventTapIsEnabled(tap: *mut std::ffi::c_void) -> bool;
     /// macOS CoreFoundation: CFRunLoop 정지
     fn CFRunLoopStop(rl: *mut std::ffi::c_void);
+    /// macOS CoreGraphics: 키보드 이벤트의 유니코드 문자열 가져오기
+    fn CGEventKeyboardGetUnicodeString(
+        event: core_graphics::sys::CGEventRef,
+        maxStringLength: u32,
+        actualStringLength: *mut u32,
+        unicodeString: *mut u16,
+    );
+}
+
+/// CGEvent에서 실제 유니코드 문자를 읽어 라틴 문자인지 확인
+/// 한글 IME의 영문 서브모드(A 모드)에서도 라틴 문자가 반환됨
+fn event_produces_latin_char(event: &CGEvent) -> bool {
+    use foreign_types_shared::ForeignType;
+    let mut actual_len: u32 = 0;
+    let mut buf: [u16; 4] = [0; 4];
+    unsafe {
+        CGEventKeyboardGetUnicodeString(
+            event.as_ptr(),
+            4,
+            &mut actual_len,
+            buf.as_mut_ptr(),
+        );
+    }
+    if actual_len == 0 {
+        return false;
+    }
+    let ch = buf[0];
+    // ASCII 라틴 문자 (a-z, A-Z)
+    matches!(ch, 0x41..=0x5A | 0x61..=0x7A)
 }
 
 /// 키 버퍼 - 입력된 영문 키를 누적
@@ -76,7 +106,7 @@ impl KeyBuffer {
 }
 
 /// Debounce 타이머 명령
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DebounceCommand {
     /// 타이머 리셋 (키 입력 시)
     Reset,
@@ -89,7 +119,7 @@ pub enum DebounceCommand {
 }
 
 /// 한글 전환 타이머 명령
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SwitchCommand {
     /// 타이머 시작/리셋 (자동 변환 후)
     Reset,
@@ -97,6 +127,16 @@ pub enum SwitchCommand {
     Cancel,
     /// 타이머 스레드 종료
     Shutdown,
+}
+
+/// Condvar 기반 debounce 타이머 상태
+struct DebounceTimerState {
+    command: Option<DebounceCommand>,
+}
+
+/// Condvar 기반 switch 타이머 상태
+struct SwitchTimerState {
+    command: Option<SwitchCommand>,
 }
 
 /// 변환 이력 (Undo용)
@@ -234,16 +274,18 @@ pub struct EventTapState {
     pub buffer: Mutex<KeyBuffer>,
     pub hotkey: HotkeyConfig,
     pub running: AtomicBool,
+    /// Koing 활성화 여부 (false이면 모든 이벤트를 그대로 통과)
+    pub enabled: AtomicBool,
     pub auto_detector: Mutex<AutoDetector>,
     pub on_convert: Mutex<Option<Box<dyn Fn(String, bool) + Send + 'static>>>,
     /// Undo 콜백 (한글 텍스트, 원본 영문 텍스트)
     pub on_undo: Mutex<Option<Box<dyn Fn(String, String) + Send + 'static>>>,
     /// 실시간 모드 활성화 여부
     pub realtime_mode: AtomicBool,
-    /// Debounce 타이머 채널
-    pub debounce_tx: Mutex<Option<Sender<DebounceCommand>>>,
-    /// 한글 전환 타이머 채널
-    pub switch_tx: Mutex<Option<Sender<SwitchCommand>>>,
+    /// Debounce 타이머 Condvar 기반 상태
+    debounce_cv: Arc<(Mutex<DebounceTimerState>, std::sync::Condvar)>,
+    /// 한글 전환 타이머 Condvar 기반 상태
+    switch_cv: Arc<(Mutex<SwitchTimerState>, std::sync::Condvar)>,
     /// 마지막 키 입력 시간 (ms 단위 epoch)
     pub last_key_time: AtomicU64,
     /// 변환 이력 (Undo용)
@@ -258,10 +300,16 @@ pub struct EventTapState {
     pub debounce_ms: AtomicU64,
     /// 한글 자판 전환 지연 시간 (ms)
     pub switch_delay_ms: AtomicU64,
+    /// 느린 변환 대기 시간 (ms) — 유효하지만 확신 낮은 한글용
+    pub slow_debounce_ms: AtomicU64,
     /// CGEventTap mach port (이벤트 탭 재활성화용)
     tap_port: AtomicPtr<std::ffi::c_void>,
     /// 이벤트 탭 스레드의 CFRunLoop (정상 종료용)
     run_loop: AtomicPtr<std::ffi::c_void>,
+    /// 재활성화 필요 플래그 (콜백에서 빠르게 반환 후 감시 스레드가 처리)
+    needs_reenable: AtomicBool,
+    /// 마지막 이벤트 수신 시간 (epoch ms, 헬스 모니터링용)
+    last_event_time: AtomicU64,
 }
 
 impl EventTapState {
@@ -270,20 +318,30 @@ impl EventTapState {
             buffer: Mutex::new(KeyBuffer::new(100)),
             hotkey,
             running: AtomicBool::new(true),
+            enabled: AtomicBool::new(true),
             auto_detector: Mutex::new(AutoDetector::default()),
             on_convert: Mutex::new(None),
             on_undo: Mutex::new(None),
             realtime_mode: AtomicBool::new(true), // 기본 활성화
-            debounce_tx: Mutex::new(None),
-            switch_tx: Mutex::new(None),
+            debounce_cv: Arc::new((
+                Mutex::new(DebounceTimerState { command: None }),
+                std::sync::Condvar::new(),
+            )),
+            switch_cv: Arc::new((
+                Mutex::new(SwitchTimerState { command: None }),
+                std::sync::Condvar::new(),
+            )),
             last_key_time: AtomicU64::new(0),
             conversion_history: Mutex::new(None),
             is_replacing: AtomicBool::new(false),
             conversion_just_triggered: AtomicBool::new(false),
+            slow_debounce_ms: AtomicU64::new(1500),
             debounce_ms: AtomicU64::new(300),
             switch_delay_ms: AtomicU64::new(0),
             tap_port: AtomicPtr::new(std::ptr::null_mut()),
             run_loop: AtomicPtr::new(std::ptr::null_mut()),
+            needs_reenable: AtomicBool::new(false),
+            last_event_time: AtomicU64::new(0),
         }
     }
 
@@ -301,6 +359,16 @@ impl EventTapState {
     {
         let mut on_undo = lock_or_recover(&self.on_undo);
         *on_undo = Some(Box::new(callback));
+    }
+
+    /// Koing 활성화/비활성화
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Koing 활성화 여부
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
     }
 
     /// 자동 감지 활성화/비활성화
@@ -338,6 +406,16 @@ impl EventTapState {
         self.debounce_ms.load(Ordering::Relaxed)
     }
 
+    /// 느린 변환 대기 시간 설정
+    pub fn set_slow_debounce_ms(&self, ms: u64) {
+        self.slow_debounce_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// 느린 변환 대기 시간 읽기
+    pub fn get_slow_debounce_ms(&self) -> u64 {
+        self.slow_debounce_ms.load(Ordering::Relaxed)
+    }
+
     /// 한글 자판 전환 지연 시간 설정
     pub fn set_switch_delay_ms(&self, ms: u64) {
         self.switch_delay_ms.store(ms, Ordering::Relaxed);
@@ -348,21 +426,21 @@ impl EventTapState {
         self.switch_delay_ms.load(Ordering::Relaxed)
     }
 
-    /// Debounce 타이머에 명령 전송
+    /// Debounce 타이머에 명령 전송 (Condvar로 즉시 깨움)
     fn send_debounce_command(&self, cmd: DebounceCommand) {
-        if let Ok(tx_guard) = self.debounce_tx.lock() {
-            if let Some(ref tx) = *tx_guard {
-                let _ = tx.send(cmd);
-            }
+        let (ref mutex, ref cvar) = *self.debounce_cv;
+        if let Ok(mut state) = mutex.lock() {
+            state.command = Some(cmd);
+            cvar.notify_one();
         }
     }
 
-    /// 한글 전환 타이머에 명령 전송
+    /// 한글 전환 타이머에 명령 전송 (Condvar로 즉시 깨움)
     pub fn send_switch_command(&self, cmd: SwitchCommand) {
-        if let Ok(tx_guard) = self.switch_tx.lock() {
-            if let Some(ref tx) = *tx_guard {
-                let _ = tx.send(cmd);
-            }
+        let (ref mutex, ref cvar) = *self.switch_cv;
+        if let Ok(mut state) = mutex.lock() {
+            state.command = Some(cmd);
+            cvar.notify_one();
         }
     }
 
@@ -381,15 +459,67 @@ impl EventTapState {
         self.tap_port.store(port, Ordering::Release);
     }
 
-    /// 비활성화된 이벤트 탭 재활성화
-    fn reenable_tap(&self) {
+    /// 재활성화 필요 플래그 설정 (콜백에서 호출 — 빠르게 반환)
+    fn request_reenable(&self) {
+        self.needs_reenable.store(true, Ordering::Release);
+    }
+
+    /// 재시도 + 검증 로직이 포함된 이벤트 탭 재활성화
+    /// Sonoma/Sequoia에서는 더 많은 재시도와 딜레이를 사용
+    fn reenable_tap_with_retry(&self) {
+        use crate::platform::os_version::{is_sequoia_or_later, is_sonoma_or_later};
+
         let port = self.tap_port.load(Ordering::Acquire);
-        if !port.is_null() {
+        if port.is_null() {
+            return;
+        }
+
+        let (initial_delay_ms, max_retries) = if is_sequoia_or_later() {
+            (50, 5)
+        } else if is_sonoma_or_later() {
+            (50, 3)
+        } else {
+            // Ventura 이하: 즉시 1회 시도
+            (0, 1)
+        };
+
+        for attempt in 0..max_retries {
+            let delay_ms = if attempt == 0 {
+                initial_delay_ms
+            } else {
+                // 지수 백오프: 50, 100, 200, 400, ...
+                initial_delay_ms * (1u64 << attempt)
+            };
+
+            if delay_ms > 0 {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+
             unsafe {
                 CGEventTapEnable(port, true);
             }
-            log::warn!("이벤트 탭 재활성화됨");
+
+            // 재활성화 성공 검증 (짧은 딜레이 후 확인)
+            thread::sleep(Duration::from_millis(10));
+            let enabled = unsafe { CGEventTapIsEnabled(port) };
+            if enabled {
+                log::warn!(
+                    "이벤트 탭 재활성화 성공 (시도 {}/{})",
+                    attempt + 1,
+                    max_retries
+                );
+                self.needs_reenable.store(false, Ordering::Release);
+                return;
+            }
+
+            log::warn!(
+                "이벤트 탭 재활성화 실패, 재시도 {}/{}",
+                attempt + 1,
+                max_retries
+            );
         }
+
+        log::error!("이벤트 탭 재활성화 최종 실패 ({}회 시도)", max_retries);
     }
 
     /// 변환 이력 가져오기 (Undo용)
@@ -418,130 +548,191 @@ impl EventTapState {
     }
 }
 
-/// Debounce 타이머 스레드 시작
+/// Debounce 타이머 스레드 시작 (Condvar 기반 — 정확한 타이밍)
 fn start_debounce_timer(state: Arc<EventTapState>) {
-    let (tx, rx) = mpsc::channel::<DebounceCommand>();
-
-    // 채널 설정
-    {
-        let mut tx_guard = lock_or_recover(&state.debounce_tx);
-        *tx_guard = Some(tx);
-    }
-
+    let cv = Arc::clone(&state.debounce_cv);
     let state_for_timer = Arc::clone(&state);
 
     thread::spawn(move || {
-        let mut last_reset = Instant::now();
+        let (ref mutex, ref cvar) = *cv;
+        let mut deadline: Option<Instant> = None;
+        // 1단계(빠른 변환) 시도 후 실패했는지 추적
+        let mut fast_triggered = false;
 
         loop {
-            // 타임아웃 대기
-            match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(DebounceCommand::Reset) => {
-                    last_reset = Instant::now();
-                }
-                Ok(DebounceCommand::Cancel) => {
-                    last_reset = Instant::now() + Duration::from_secs(3600); // 먼 미래로
-                }
-                Ok(DebounceCommand::Trigger) => {
-                    // 즉시 트리거
-                    trigger_realtime_conversion(&state_for_timer);
-                    last_reset = Instant::now() + Duration::from_secs(3600);
-                }
-                Ok(DebounceCommand::Shutdown) => {
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let debounce_duration = Duration::from_millis(
-                        state_for_timer.debounce_ms.load(Ordering::Relaxed),
-                    );
-                    if last_reset.elapsed() >= debounce_duration {
-                        trigger_realtime_conversion(&state_for_timer);
-                        last_reset = Instant::now() + Duration::from_secs(3600);
+            let mut guard = lock_or_recover(mutex);
+
+            // 대기: 명령이 오거나 deadline까지
+            loop {
+                // 명령 확인
+                if let Some(cmd) = guard.command.take() {
+                    match cmd {
+                        DebounceCommand::Reset => {
+                            deadline = Some(Instant::now());
+                            fast_triggered = false;
+                        }
+                        DebounceCommand::Cancel => {
+                            deadline = None;
+                            fast_triggered = false;
+                        }
+                        DebounceCommand::Trigger => {
+                            trigger_realtime_conversion(&state_for_timer);
+                            deadline = None;
+                            fast_triggered = false;
+                        }
+                        DebounceCommand::Shutdown => {
+                            return;
+                        }
                     }
+                    continue; // 추가 명령이 있을 수 있으므로 재확인
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+
+                // deadline 계산
+                let remaining = if let Some(reset_time) = deadline {
+                    let elapsed = reset_time.elapsed();
+                    let target_duration = if fast_triggered {
+                        Duration::from_millis(
+                            state_for_timer.slow_debounce_ms.load(Ordering::Relaxed),
+                        )
+                    } else {
+                        Duration::from_millis(
+                            state_for_timer.debounce_ms.load(Ordering::Relaxed),
+                        )
+                    };
+
+                    if elapsed >= target_duration {
+                        // 타이머 만료
+                        break;
+                    }
+                    target_duration - elapsed
+                } else {
+                    // deadline 없음 — 무한 대기
+                    Duration::from_secs(3600)
+                };
+
+                let (new_guard, timeout_result) = cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
+                    let g = e.into_inner();
+                    (g.0, g.1)
+                });
+                guard = new_guard;
+
+                if timeout_result.timed_out() && deadline.is_some() {
                     break;
                 }
+            }
+
+            // deadline이 없으면 (Cancel 상태) 루프 재시작
+            if deadline.is_none() {
+                continue;
+            }
+
+            // 타이머 만료 — 변환 시도
+            if !fast_triggered {
+                // 1단계: 높은 confidence 변환 시도
+                if trigger_realtime_conversion(&state_for_timer) {
+                    deadline = None;
+                    fast_triggered = false;
+                } else {
+                    fast_triggered = true; // 1단계 실패, 2단계 대기
+                    // deadline은 유지 — slow_debounce_ms까지 추가 대기
+                }
+            } else {
+                // 2단계: 유효한 한글 구조이면 변환
+                trigger_slow_conversion(&state_for_timer);
+                deadline = None;
+                fast_triggered = false;
             }
         }
     });
 }
 
-/// 한글 전환 타이머 스레드 시작
-/// 자동 변환 후 500ms간 추가 입력이 없으면 한글 입력 소스로 전환
+/// 한글 전환 타이머 스레드 시작 (Condvar 기반 — 정확한 타이밍)
+/// 자동 변환 후 switch_delay_ms간 추가 입력이 없으면 한글 입력 소스로 전환
 fn start_switch_timer(state: Arc<EventTapState>) {
-    let (tx, rx) = mpsc::channel::<SwitchCommand>();
-
-    // 채널 설정
-    {
-        let mut tx_guard = lock_or_recover(&state.switch_tx);
-        *tx_guard = Some(tx);
-    }
-
+    let cv = Arc::clone(&state.switch_cv);
     let state_for_timer = Arc::clone(&state);
 
     thread::spawn(move || {
-        // 초기 상태: 비활성 (먼 미래)
-        let mut last_reset = Instant::now() + Duration::from_secs(3600);
-        // 한글 전환이 이미 실행된 상태인지 추적
-        // true이면 추가 Reset을 무시하여 이중 전환 방지
+        let (ref mutex, ref cvar) = *cv;
+        let mut deadline: Option<Instant> = None;
         let mut switch_fired = false;
 
         loop {
-            match rx.recv_timeout(Duration::from_millis(5)) {
-                Ok(SwitchCommand::Reset) => {
-                    if switch_fired {
-                        // 이미 한글 전환 완료 상태 — 중복 Reset 무시
-                    } else {
-                        last_reset = Instant::now();
-                    }
-                }
-                Ok(SwitchCommand::Cancel) => {
-                    last_reset = Instant::now() + Duration::from_secs(3600);
-                    // 새 타이핑 시작 → 다음 변환 사이클에서 전환 허용
-                    switch_fired = false;
-                }
-                Ok(SwitchCommand::Shutdown) => {
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let switch_delay_ms = state_for_timer.switch_delay_ms.load(Ordering::Relaxed);
-                    if switch_delay_ms == 0 {
-                        // 0ms는 main.rs에서 직접 전환 — 타이머 불필요
-                        continue;
-                    }
-                    let switch_delay = Duration::from_millis(switch_delay_ms);
-                    if !switch_fired && last_reset.elapsed() >= switch_delay {
-                        if let Err(e) = switch_to_korean() {
-                            log::warn!("[SwitchTimer] 한글 전환 실패: {}", e);
+            let mut guard = lock_or_recover(mutex);
+
+            loop {
+                // 명령 확인
+                if let Some(cmd) = guard.command.take() {
+                    match cmd {
+                        SwitchCommand::Reset => {
+                            deadline = Some(Instant::now());
+                            switch_fired = false;
                         }
-                        last_reset = Instant::now() + Duration::from_secs(3600);
-                        switch_fired = true;
+                        SwitchCommand::Cancel => {
+                            deadline = None;
+                            switch_fired = false;
+                        }
+                        SwitchCommand::Shutdown => {
+                            return;
+                        }
                     }
+                    continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+
+                let remaining = if let Some(reset_time) = deadline {
+                    let switch_delay_ms = state_for_timer.switch_delay_ms.load(Ordering::Relaxed);
+                    let target = Duration::from_millis(switch_delay_ms);
+                    let elapsed = reset_time.elapsed();
+                    if elapsed >= target {
+                        break;
+                    }
+                    target - elapsed
+                } else {
+                    Duration::from_secs(3600)
+                };
+
+                let (new_guard, timeout_result) = cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
+                    let g = e.into_inner();
+                    (g.0, g.1)
+                });
+                guard = new_guard;
+
+                if timeout_result.timed_out() && deadline.is_some() {
                     break;
                 }
             }
+
+            if deadline.is_none() {
+                continue;
+            }
+
+            // 타이머 만료 — 한글 전환
+            if !switch_fired {
+                if let Err(e) = switch_to_korean() {
+                    log::warn!("[SwitchTimer] 한글 전환 실패: {}", e);
+                }
+                switch_fired = true;
+            }
+            deadline = None;
         }
     });
 }
 
-/// 실시간 변환 트리거
-fn trigger_realtime_conversion(state: &EventTapState) {
+/// 실시간 변환 트리거 (1단계: 높은 confidence)
+/// 반환값: true이면 변환 성공, false이면 변환 조건 미충족
+fn trigger_realtime_conversion(state: &EventTapState) -> bool {
     if !state.is_realtime_mode() {
-        return;
+        return false;
     }
 
-    // 텍스트 교체 중이면 실시간 변환 스킵 (레이스 컨디션 방지)
     if state.is_replacing.load(Ordering::Acquire) {
-        return;
+        return false;
     }
 
     let should_convert = {
         let buffer = lock_or_recover(&state.buffer);
         if buffer.is_empty() {
-            return;
+            return false;
         }
         let detector = lock_or_recover(&state.auto_detector);
         detector.should_convert_realtime(buffer.get())
@@ -560,10 +751,128 @@ fn trigger_realtime_conversion(state: &EventTapState) {
                 .conversion_just_triggered
                 .store(true, Ordering::Release);
             if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
-                callback(buffer_content, false); // 실시간 debounce
+                callback(buffer_content, false);
             }
+            return true;
         }
     }
+    false
+}
+
+/// 느린 변환 트리거 (2단계: 구조적 유효성 검사)
+/// N-gram 점수가 낮지만 유효한 한글 구조를 가진 입력을 변환
+fn trigger_slow_conversion(state: &EventTapState) -> bool {
+    if !state.is_realtime_mode() {
+        return false;
+    }
+    if state.is_replacing.load(Ordering::Acquire) {
+        return false;
+    }
+
+    let buffer_content = {
+        let buffer = lock_or_recover(&state.buffer);
+        if buffer.is_empty() {
+            return false;
+        }
+        buffer.get().to_string()
+    };
+
+    // 한글로 변환
+    let converted = crate::core::converter::convert(&buffer_content);
+    if converted == buffer_content {
+        return false;
+    }
+
+    // 낱자모(미완성 자모) 포함 시 거부
+    if crate::detection::validator::has_incomplete_jamo(&converted) {
+        return false;
+    }
+
+    // 음절 구조 검사
+    if !crate::ngram::check_syllable_structure(&converted) {
+        return false;
+    }
+
+    // 한 글자 변환은 오탐 방지
+    if converted.chars().count() <= 1 {
+        return false;
+    }
+
+    // 최소한의 confidence 확인 (threshold 70)
+    let has_min_confidence = {
+        let detector = lock_or_recover(&state.auto_detector);
+        detector.should_convert(&buffer_content)
+    };
+    if !has_min_confidence {
+        return false;
+    }
+
+    // 변환 실행
+    let content = {
+        let mut buffer = lock_or_recover(&state.buffer);
+        let c = buffer.get().to_string();
+        buffer.clear();
+        c
+    };
+
+    if !content.is_empty() {
+        state
+            .conversion_just_triggered
+            .store(true, Ordering::Release);
+        if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
+            callback(content, false);
+        }
+        return true;
+    }
+    false
+}
+
+/// 재활성화 감시 스레드 시작
+/// needs_reenable 플래그를 폴링하여 재활성화 수행
+fn start_reenable_watcher(state: Arc<EventTapState>) {
+    let state_for_watcher = Arc::clone(&state);
+    thread::spawn(move || {
+        while state_for_watcher.running.load(Ordering::Acquire) {
+            if state_for_watcher.needs_reenable.load(Ordering::Acquire) {
+                state_for_watcher.reenable_tap_with_retry();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+/// 이벤트 탭 헬스 모니터링 스레드 시작
+/// 60초 이상 이벤트가 없으면 자동 재활성화 시도
+fn start_health_monitor(state: Arc<EventTapState>) {
+    let state_for_monitor = Arc::clone(&state);
+    thread::spawn(move || {
+        // 초기 30초 대기 (앱 시작 직후 이벤트 없는 것은 정상)
+        thread::sleep(Duration::from_secs(30));
+
+        while state_for_monitor.running.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_secs(30));
+
+            let last = state_for_monitor.last_event_time.load(Ordering::Acquire);
+            if last == 0 {
+                // 아직 이벤트를 한 번도 받지 못함 — 스킵
+                continue;
+            }
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let elapsed_sec = (now_ms.saturating_sub(last)) / 1000;
+            if elapsed_sec >= 60 {
+                log::warn!(
+                    "헬스 모니터: {}초간 이벤트 없음, 이벤트 탭 재활성화 시도",
+                    elapsed_sec
+                );
+                state_for_monitor.request_reenable();
+            }
+        }
+    });
 }
 
 /// 이벤트 탭 시작
@@ -573,6 +882,10 @@ pub fn start_event_tap(state: Arc<EventTapState>) -> Result<(), String> {
     start_debounce_timer(Arc::clone(&state));
     // 한글 전환 타이머 시작
     start_switch_timer(Arc::clone(&state));
+    // 재활성화 감시 스레드 시작
+    start_reenable_watcher(Arc::clone(&state));
+    // 헬스 모니터링 스레드 시작
+    start_health_monitor(Arc::clone(&state));
 
     let state_clone = Arc::clone(&state);
 
@@ -622,13 +935,26 @@ fn handle_event(
         return Some(event.clone());
     }
 
-    // macOS가 이벤트 탭을 비활성화했으면 즉시 재활성화
+    // Koing 비활성화 상태이면 모든 이벤트를 그대로 통과
+    if !state.is_enabled() {
+        return Some(event.clone());
+    }
+
+    // 마지막 이벤트 수신 시간 업데이트 (헬스 모니터링용)
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    state.last_event_time.store(now_ms, Ordering::Release);
+
+    // macOS가 이벤트 탭을 비활성화했으면 재활성화 요청
+    // 콜백에서 직접 재시도하지 않고, 감시 스레드가 처리하도록 플래그만 설정
     if matches!(
         event_type,
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
         log::warn!("이벤트 탭 비활성화 감지: {:?}", event_type);
-        state.reenable_tap();
+        state.request_reenable();
         return Some(event.clone());
     }
 
@@ -700,13 +1026,26 @@ fn handle_event(
                 return Some(event.clone());
             }
 
-            // Space 또는 Enter 입력 시 자동 감지 체크
-            if keycode == 49 || keycode == 36 {
-                // 49 = Space, 36 = Enter
-                // Debounce 취소 (한글 전환 타이머는 유지 — Space는 단어 경계이므로)
+            // Space 입력 시: 버퍼 초기화 (변환 트리거 없이 통과)
+            if keycode == 49 {
+                state.send_debounce_command(DebounceCommand::Cancel);
+                // debounce가 직전에 버퍼를 소비했다면 Space 소비
+                if state
+                    .conversion_just_triggered
+                    .swap(false, Ordering::AcqRel)
+                {
+                    lock_or_recover(&state.buffer).clear();
+                    return None;
+                }
+                lock_or_recover(&state.buffer).clear();
+                return Some(event.clone());
+            }
+
+            // Enter 입력 시 버퍼 초기화 (자동 변환 비활성화)
+            if keycode == 36 {
                 state.send_debounce_command(DebounceCommand::Cancel);
 
-                // debounce가 직전에 버퍼를 소비했다면 Space/Enter 소비
+                // debounce가 직전에 버퍼를 소비했다면 Enter 소비
                 if state
                     .conversion_just_triggered
                     .swap(false, Ordering::AcqRel)
@@ -715,40 +1054,17 @@ fn handle_event(
                     return None;
                 }
 
-                let should_convert = {
-                    let buffer = lock_or_recover(&state.buffer);
-                    let detector = lock_or_recover(&state.auto_detector);
-                    detector.should_convert(buffer.get())
-                };
-
-                if should_convert {
-                    // 자동 변환 트리거
-                    let buffer_content = {
-                        let mut buffer = lock_or_recover(&state.buffer);
-                        let content = buffer.get().to_string();
-                        buffer.clear();
-                        content
-                    };
-
-                    if !buffer_content.is_empty() {
-                        if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
-                            callback(buffer_content, false); // 자동 감지
-                        }
-                    }
-
-                    // 자동 변환 시 Space/Enter 이벤트를 소비 (입력되지 않음)
-                    return None;
-                }
-
-                // 자동 감지 조건 미충족 시 버퍼만 초기화
                 lock_or_recover(&state.buffer).clear();
                 return Some(event.clone());
             }
 
             // 문자 키 처리 - 영문 입력 모드일 때만 버퍼링
             if let Some(c) = keycode_to_char(keycode, shift_pressed) {
-                // 현재 입력 소스 확인 (한글 모드면 버퍼링 안함)
-                if !is_english_input_source() {
+                // 현재 입력 소스 확인 + CGEvent 유니코드 문자 확인
+                // 한글 IME 영문 서브모드(A 모드)에서도 라틴 문자가 출력되므로,
+                // TIS API와 CGEvent 유니코드를 모두 확인하여 정확히 판별
+                let is_english = is_english_input_source() || event_produces_latin_char(event);
+                if !is_english {
                     // 한글 입력 모드: 버퍼 클리어하고 패스스루
                     lock_or_recover(&state.buffer).clear();
                     state.send_debounce_command(DebounceCommand::Cancel);
@@ -811,6 +1127,12 @@ fn handle_event(
                     }
                 }
             }
+
+            Some(event.clone())
+        }
+        CGEventType::FlagsChanged => {
+            // 수정키 변경 시 입력 소스 캐시 무효화
+            invalidate_input_source_cache();
 
             Some(event.clone())
         }

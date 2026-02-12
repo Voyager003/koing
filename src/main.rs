@@ -5,7 +5,8 @@ use koing::ngram::KoreanValidator;
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
     input_source::switch_to_korean,
-    permissions::request_accessibility_permission,
+    os_version::{get_macos_version, is_sonoma_or_later},
+    permissions::{request_accessibility_permission, wait_for_accessibility_permission},
     text_replacer::{replace_text, undo_replace_text},
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -13,6 +14,7 @@ use koing::ui::menubar::MenuBarApp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 
 /// 워커 스레드가 처리할 작업 항목
 enum WorkItem {
@@ -26,16 +28,32 @@ fn main() {
     // 로깅 초기화 (error/warn만 출력)
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    // Accessibility 권한 확인
+    // macOS 버전 로깅
+    let version = get_macos_version();
+    log::warn!("macOS {} 에서 실행 중", version);
 
-    if !request_accessibility_permission(true) {
+    // Accessibility 권한 확인
+    if is_sonoma_or_later() {
+        // Sonoma/Sequoia에서는 TCC DB 업데이트가 지연될 수 있으므로 폴링 대기
+        if !wait_for_accessibility_permission(Duration::from_secs(30)) {
+            eprintln!();
+            eprintln!("⚠️  Accessibility 권한이 필요합니다.");
+            eprintln!("   시스템 설정 > 개인 정보 보호 및 보안 > 손쉬운 사용");
+            eprintln!("   에서 이 앱을 허용해주세요.");
+            eprintln!();
+            eprintln!("권한이 인식되지 않는 경우 다음 명령어를 실행해보세요:");
+            eprintln!("   tccutil reset Accessibility com.koing.app");
+            eprintln!();
+            eprintln!("권한을 허용한 후 앱을 다시 실행해주세요.");
+            std::process::exit(1);
+        }
+    } else if !request_accessibility_permission(true) {
         eprintln!();
         eprintln!("⚠️  Accessibility 권한이 필요합니다.");
         eprintln!("   시스템 설정 > 개인 정보 보호 및 보안 > 손쉬운 사용");
         eprintln!("   에서 이 앱을 허용해주세요.");
         eprintln!();
         eprintln!("권한을 허용한 후 앱을 다시 실행해주세요.");
-
     }
 
     // 설정 로드
@@ -46,8 +64,10 @@ fn main() {
 
     // 이벤트 탭 상태
     let event_state = Arc::new(EventTapState::new(HotkeyConfig::default()));
+    event_state.set_enabled(config.enabled);
     event_state.set_debounce_ms(config.debounce_ms);
     event_state.set_switch_delay_ms(config.switch_delay_ms);
+    event_state.set_slow_debounce_ms(config.slow_debounce_ms);
 
     // 워커 스레드 채널 — 변환/Undo 작업을 단일 스레드에서 직렬 처리
     let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
@@ -76,27 +96,28 @@ fn main() {
                         .is_replacing
                         .store(true, AtomicOrdering::Release);
 
-                    // 한글 전환을 텍스트 교체와 동시에 시작
-                    // replace_text()는 백스페이스/붙여넣기를 keycode로 시뮬레이션하므로
-                    // 입력 소스와 무관하게 동작함
-                    thread::spawn(|| {
-                        if let Err(e) = switch_to_korean() {
-                            log::warn!("한글 전환 실패: {}", e);
-                        }
-                    });
-
-                    // 텍스트 교체 (이 동안 한글 전환도 진행됨)
                     let backspace_count = buffer.chars().count();
                     let replace_result = replace_text(backspace_count, &hangul);
+
+                    if let Err(e) = replace_result {
+                        event_state_for_worker
+                            .is_replacing
+                            .store(false, AtomicOrdering::Release);
+                        log::error!("텍스트 교체 실패: {}", e);
+                        continue;
+                    }
+
+                    // paste 처리 완료 대기 (is_replacing=true 유지하여 이벤트 탭 간섭 차단)
+                    thread::sleep(Duration::from_millis(200));
+
+                    // 한글 자판 전환 (is_replacing=true 상태에서 수행)
+                    if let Err(e) = switch_to_korean() {
+                        log::warn!("한글 전환 실패: {}", e);
+                    }
 
                     event_state_for_worker
                         .is_replacing
                         .store(false, AtomicOrdering::Release);
-
-                    if let Err(e) = replace_result {
-                        log::error!("텍스트 교체 실패: {}", e);
-                        continue;
-                    }
 
                     // 변환 이력 저장 (Undo용)
                     event_state_for_worker.save_conversion_history(buffer, hangul);
