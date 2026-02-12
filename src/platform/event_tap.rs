@@ -25,6 +25,35 @@ extern "C" {
     fn CGEventTapIsEnabled(tap: *mut std::ffi::c_void) -> bool;
     /// macOS CoreFoundation: CFRunLoop 정지
     fn CFRunLoopStop(rl: *mut std::ffi::c_void);
+    /// macOS CoreGraphics: 키보드 이벤트의 유니코드 문자열 가져오기
+    fn CGEventKeyboardGetUnicodeString(
+        event: core_graphics::sys::CGEventRef,
+        maxStringLength: u32,
+        actualStringLength: *mut u32,
+        unicodeString: *mut u16,
+    );
+}
+
+/// CGEvent에서 실제 유니코드 문자를 읽어 라틴 문자인지 확인
+/// 한글 IME의 영문 서브모드(A 모드)에서도 라틴 문자가 반환됨
+fn event_produces_latin_char(event: &CGEvent) -> bool {
+    use foreign_types_shared::ForeignType;
+    let mut actual_len: u32 = 0;
+    let mut buf: [u16; 4] = [0; 4];
+    unsafe {
+        CGEventKeyboardGetUnicodeString(
+            event.as_ptr(),
+            4,
+            &mut actual_len,
+            buf.as_mut_ptr(),
+        );
+    }
+    if actual_len == 0 {
+        return false;
+    }
+    let ch = buf[0];
+    // ASCII 라틴 문자 (a-z, A-Z)
+    matches!(ch, 0x41..=0x5A | 0x61..=0x7A)
 }
 
 /// 키 버퍼 - 입력된 영문 키를 누적
@@ -696,7 +725,6 @@ fn trigger_realtime_conversion(state: &EventTapState) -> bool {
         return false;
     }
 
-    // 텍스트 교체 중이면 실시간 변환 스킵 (레이스 컨디션 방지)
     if state.is_replacing.load(Ordering::Acquire) {
         return false;
     }
@@ -723,7 +751,7 @@ fn trigger_realtime_conversion(state: &EventTapState) -> bool {
                 .conversion_just_triggered
                 .store(true, Ordering::Release);
             if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
-                callback(buffer_content, false); // 실시간 debounce
+                callback(buffer_content, false);
             }
             return true;
         }
@@ -1032,8 +1060,11 @@ fn handle_event(
 
             // 문자 키 처리 - 영문 입력 모드일 때만 버퍼링
             if let Some(c) = keycode_to_char(keycode, shift_pressed) {
-                // 현재 입력 소스 확인 (한글 모드면 버퍼링 안함)
-                if !is_english_input_source() {
+                // 현재 입력 소스 확인 + CGEvent 유니코드 문자 확인
+                // 한글 IME 영문 서브모드(A 모드)에서도 라틴 문자가 출력되므로,
+                // TIS API와 CGEvent 유니코드를 모두 확인하여 정확히 판별
+                let is_english = is_english_input_source() || event_produces_latin_char(event);
+                if !is_english {
                     // 한글 입력 모드: 버퍼 클리어하고 패스스루
                     lock_or_recover(&state.buffer).clear();
                     state.send_debounce_command(DebounceCommand::Cancel);

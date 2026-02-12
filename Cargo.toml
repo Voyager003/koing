@@ -26,6 +26,7 @@ serde_json = "1"
 
 # Utilities
 lazy_static = "1.5"
+foreign-types-shared = "0.3"
 
 # Logging
 log = "0.4"
