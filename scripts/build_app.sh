@@ -55,6 +55,12 @@ fi
 
 echo "==> Created $APP_NAME"
 
+# Ad-hoc code sign (binds Info.plist + seals resources → TCC persistence)
+echo "==> Code signing $APP_NAME"
+codesign --force --deep --sign - "$APP_DIR"
+codesign --verify "$APP_DIR"
+echo "==> Code signing verified"
+
 # Create zip for distribution
 (cd "$PROJECT_DIR" && zip -r -y "$ZIP_NAME" "$APP_NAME")
 echo "==> Created $ZIP_NAME"

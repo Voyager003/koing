@@ -361,7 +361,7 @@ impl MenuBarApp {
 
             // Koing v0.2 (비활성)
             let version_item = NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(
-                NSString::alloc(nil).init_str("Koing v0.2"),
+                NSString::alloc(nil).init_str(concat!("Koing v", env!("CARGO_PKG_VERSION"))),
                 selector(""),
                 NSString::alloc(nil).init_str(""),
             );
