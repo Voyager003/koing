@@ -25,35 +25,6 @@ extern "C" {
     fn CGEventTapIsEnabled(tap: *mut std::ffi::c_void) -> bool;
     /// macOS CoreFoundation: CFRunLoop 정지
     fn CFRunLoopStop(rl: *mut std::ffi::c_void);
-    /// macOS CoreGraphics: 키보드 이벤트의 유니코드 문자열 가져오기
-    fn CGEventKeyboardGetUnicodeString(
-        event: core_graphics::sys::CGEventRef,
-        maxStringLength: u32,
-        actualStringLength: *mut u32,
-        unicodeString: *mut u16,
-    );
-}
-
-/// CGEvent에서 실제 유니코드 문자를 읽어 라틴 문자인지 확인
-/// 한글 IME의 영문 서브모드(A 모드)에서도 라틴 문자가 반환됨
-fn event_produces_latin_char(event: &CGEvent) -> bool {
-    use foreign_types_shared::ForeignType;
-    let mut actual_len: u32 = 0;
-    let mut buf: [u16; 4] = [0; 4];
-    unsafe {
-        CGEventKeyboardGetUnicodeString(
-            event.as_ptr(),
-            4,
-            &mut actual_len,
-            buf.as_mut_ptr(),
-        );
-    }
-    if actual_len == 0 {
-        return false;
-    }
-    let ch = buf[0];
-    // ASCII 라틴 문자 (a-z, A-Z)
-    matches!(ch, 0x41..=0x5A | 0x61..=0x7A)
 }
 
 /// 키 버퍼 - 입력된 영문 키를 누적
@@ -1060,10 +1031,11 @@ fn handle_event(
 
             // 문자 키 처리 - 영문 입력 모드일 때만 버퍼링
             if let Some(c) = keycode_to_char(keycode, shift_pressed) {
-                // 현재 입력 소스 확인 + CGEvent 유니코드 문자 확인
-                // 한글 IME 영문 서브모드(A 모드)에서도 라틴 문자가 출력되므로,
-                // TIS API와 CGEvent 유니코드를 모두 확인하여 정확히 판별
-                let is_english = is_english_input_source() || event_produces_latin_char(event);
+                // 현재 입력 소스 확인 (TIS API)
+                // 한글 IME 영문 서브모드(A 모드)도 is_english_input_source()에서 감지됨
+                // 주의: CGEvent 유니코드(event_produces_latin_char)는 HID 레벨에서
+                //       IME 처리 전 raw 문자를 반환하므로 한글 모드에서도 true가 될 수 있음
+                let is_english = is_english_input_source();
                 if !is_english {
                     // 한글 입력 모드: 버퍼 클리어하고 패스스루
                     lock_or_recover(&state.buffer).clear();

@@ -99,11 +99,22 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 /// 입력 소스 ID가 한글 입력기인지 확인
 /// macOS 기본 한글 + 서드파티 입력기(구름, 한글 등) 포함
 /// ASCII case-insensitive 비교로 String 할당 없이 검사
+///
+/// 주의: 한글 IME의 영문 서브모드(Korean.Roman)도 "korean"을 포함하므로
+/// 이 함수만으로는 실제 한글 타이핑 중인지 알 수 없음.
+/// `is_korean_english_submode`와 함께 사용할 것.
 pub(crate) fn is_korean_input_source_id(id: &str) -> bool {
     contains_ascii_case_insensitive(id, "korean")
         || contains_ascii_case_insensitive(id, "hangul")
         || contains_ascii_case_insensitive(id, "gureum")
         || contains_ascii_case_insensitive(id, "hangeul")
+}
+
+/// 한글 IME의 영문 서브모드(A 모드)인지 확인
+/// e.g., com.apple.inputmethod.Korean.Roman
+/// 입력 소스 ID에 "korean"과 "roman"이 모두 포함되면 영문 서브모드로 판단
+fn is_korean_english_submode(id: &str) -> bool {
+    is_korean_input_source_id(id) && contains_ascii_case_insensitive(id, "roman")
 }
 
 /// 현재 영문 입력 소스인지 확인 (캐시 활용)
@@ -115,7 +126,8 @@ pub fn is_english_input_source() -> bool {
 
     // 캐시 미스 — TIS API 호출 후 캐시 갱신
     let is_english = if let Some(id) = get_current_input_source_id() {
-        !is_korean_input_source_id(&id)
+        // 한글 IME 영문 서브모드(A 모드)는 영문으로 취급
+        !is_korean_input_source_id(&id) || is_korean_english_submode(&id)
     } else {
         true
     };
@@ -380,5 +392,33 @@ mod tests {
     fn test_is_english_input_source() {
         let is_english = is_english_input_source();
         println!("영문 입력 소스 여부: {}", is_english);
+    }
+
+    #[test]
+    fn test_is_korean_input_source_id() {
+        // macOS 기본 한글 입력기
+        assert!(is_korean_input_source_id("com.apple.inputmethod.Korean.2SetKorean"));
+        assert!(is_korean_input_source_id("com.apple.inputmethod.Korean.3SetKorean"));
+        assert!(is_korean_input_source_id("com.apple.inputmethod.Korean.Roman"));
+
+        // 서드파티 입력기
+        assert!(is_korean_input_source_id("org.youknowone.inputmethod.Gureum.han2"));
+
+        // 영문 입력기
+        assert!(!is_korean_input_source_id("com.apple.keylayout.ABC"));
+        assert!(!is_korean_input_source_id("com.apple.keylayout.US"));
+    }
+
+    #[test]
+    fn test_is_korean_english_submode() {
+        // 한글 IME 영문 서브모드 (A 모드) → 영문으로 취급해야 함
+        assert!(is_korean_english_submode("com.apple.inputmethod.Korean.Roman"));
+
+        // 한글 타이핑 모드 → 한글로 취급해야 함
+        assert!(!is_korean_english_submode("com.apple.inputmethod.Korean.2SetKorean"));
+        assert!(!is_korean_english_submode("com.apple.inputmethod.Korean.3SetKorean"));
+
+        // 영문 입력기 → false (korean이 아니므로)
+        assert!(!is_korean_english_submode("com.apple.keylayout.ABC"));
     }
 }
