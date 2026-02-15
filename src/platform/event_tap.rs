@@ -539,8 +539,16 @@ fn start_debounce_timer(state: Arc<EventTapState>) {
                 if let Some(cmd) = guard.command.take() {
                     match cmd {
                         DebounceCommand::Reset => {
-                            deadline = Some(Instant::now());
-                            fast_triggered = false;
+                            // Stage 2 대기 중(fast_triggered=true)에 새 키 입력이 오면
+                            // Stage 2 deadline만 갱신하고, Stage 1로 되돌리지 않음.
+                            // 이렇게 해야 borderline confidence(70-79) 한글이
+                            // 계속 Stage 1 실패→리셋을 반복하는 루프를 피할 수 있음.
+                            if !fast_triggered {
+                                deadline = Some(Instant::now());
+                            } else {
+                                // Stage 2 대기 중: deadline만 갱신 (fast_triggered 유지)
+                                deadline = Some(Instant::now());
+                            }
                         }
                         DebounceCommand::Cancel => {
                             deadline = None;
@@ -605,7 +613,8 @@ fn start_debounce_timer(state: Arc<EventTapState>) {
                     fast_triggered = false;
                 } else {
                     fast_triggered = true; // 1단계 실패, 2단계 대기
-                    // deadline은 유지 — slow_debounce_ms까지 추가 대기
+                    // deadline을 현재 시점으로 갱신 — slow_debounce_ms만큼 추가 대기
+                    deadline = Some(Instant::now());
                 }
             } else {
                 // 2단계: 유효한 한글 구조이면 변환
@@ -700,34 +709,29 @@ fn trigger_realtime_conversion(state: &EventTapState) -> bool {
         return false;
     }
 
-    let should_convert = {
-        let buffer = lock_or_recover(&state.buffer);
+    // 버퍼 검증 + 소비를 단일 lock 범위에서 수행하여
+    // 검증과 소비 사이에 새 키 입력이 끼어드는 race condition 방지
+    let buffer_content = {
+        let mut buffer = lock_or_recover(&state.buffer);
         if buffer.is_empty() {
             return false;
         }
         let detector = lock_or_recover(&state.auto_detector);
-        detector.should_convert_realtime(buffer.get())
+        if !detector.should_convert_realtime(buffer.get()) {
+            return false;
+        }
+        let content = buffer.get().to_string();
+        buffer.clear();
+        content
     };
 
-    if should_convert {
-        let buffer_content = {
-            let mut buffer = lock_or_recover(&state.buffer);
-            let content = buffer.get().to_string();
-            buffer.clear();
-            content
-        };
-
-        if !buffer_content.is_empty() {
-            state
-                .conversion_just_triggered
-                .store(true, Ordering::Release);
-            if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
-                callback(buffer_content, false);
-            }
-            return true;
-        }
+    state
+        .conversion_just_triggered
+        .store(true, Ordering::SeqCst);
+    if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
+        callback(buffer_content, false);
     }
-    false
+    true
 }
 
 /// 느린 변환 트리거 (2단계: 구조적 유효성 검사)
@@ -740,62 +744,54 @@ fn trigger_slow_conversion(state: &EventTapState) -> bool {
         return false;
     }
 
+    // 버퍼 검증 + 소비를 단일 lock 범위에서 수행하여
+    // 검증과 소비 사이에 새 키 입력이 끼어드는 race condition 방지
     let buffer_content = {
-        let buffer = lock_or_recover(&state.buffer);
+        let mut buffer = lock_or_recover(&state.buffer);
         if buffer.is_empty() {
             return false;
         }
-        buffer.get().to_string()
-    };
+        let content = buffer.get().to_string();
 
-    // 한글로 변환
-    let converted = crate::core::converter::convert(&buffer_content);
-    if converted == buffer_content {
-        return false;
-    }
-
-    // 낱자모(미완성 자모) 포함 시 거부
-    if crate::detection::validator::has_incomplete_jamo(&converted) {
-        return false;
-    }
-
-    // 음절 구조 검사
-    if !crate::ngram::check_syllable_structure(&converted) {
-        return false;
-    }
-
-    // 한 글자 변환은 오탐 방지
-    if converted.chars().count() <= 1 {
-        return false;
-    }
-
-    // 최소한의 confidence 확인 (threshold 70)
-    let has_min_confidence = {
-        let detector = lock_or_recover(&state.auto_detector);
-        detector.should_convert(&buffer_content)
-    };
-    if !has_min_confidence {
-        return false;
-    }
-
-    // 변환 실행
-    let content = {
-        let mut buffer = lock_or_recover(&state.buffer);
-        let c = buffer.get().to_string();
-        buffer.clear();
-        c
-    };
-
-    if !content.is_empty() {
-        state
-            .conversion_just_triggered
-            .store(true, Ordering::Release);
-        if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
-            callback(content, false);
+        // 한글로 변환
+        let converted = crate::core::converter::convert(&content);
+        if converted == content {
+            return false;
         }
-        return true;
+
+        // 낱자모(미완성 자모) 포함 시 거부
+        if crate::detection::validator::has_incomplete_jamo(&converted) {
+            return false;
+        }
+
+        // 음절 구조 검사
+        if !crate::ngram::check_syllable_structure(&converted) {
+            return false;
+        }
+
+        // 한 글자 변환은 오탐 방지
+        if converted.chars().count() <= 1 {
+            return false;
+        }
+
+        // 최소한의 confidence 확인 (threshold 70)
+        let detector = lock_or_recover(&state.auto_detector);
+        if !detector.should_convert(&content) {
+            return false;
+        }
+
+        // 모든 검증 통과 — 버퍼 소비
+        buffer.clear();
+        content
+    };
+
+    state
+        .conversion_just_triggered
+        .store(true, Ordering::Release);
+    if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
+        callback(buffer_content, false);
     }
-    false
+    true
 }
 
 /// 재활성화 감시 스레드 시작
@@ -1049,7 +1045,7 @@ fn handle_event(
 
                 state
                     .conversion_just_triggered
-                    .store(false, Ordering::Relaxed);
+                    .store(false, Ordering::SeqCst);
                 lock_or_recover(&state.buffer).push(c);
 
                 // 타이핑 중이므로 한글 전환 타이머 취소

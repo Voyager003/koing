@@ -6,7 +6,7 @@ use core_foundation::array::CFArrayRef;
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -15,6 +15,18 @@ use std::time::Duration;
 static INPUT_SOURCE_IS_ENGLISH: AtomicBool = AtomicBool::new(true);
 /// 캐시 유효 여부
 static INPUT_SOURCE_CACHE_VALID: AtomicBool = AtomicBool::new(false);
+/// 캐시 마지막 갱신 시간 (epoch ms)
+static INPUT_SOURCE_CACHE_TIME: AtomicU64 = AtomicU64::new(0);
+/// 캐시 유효 기간 (ms) — 외부 도구(InputSource Pro 등)의 입력 소스 변경을 감지하기 위한 TTL
+const INPUT_SOURCE_CACHE_TTL_MS: u64 = 100;
+
+/// 현재 시간을 epoch ms로 반환
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// 입력 소스 캐시 무효화
 /// FlagsChanged, switch_to_korean(), switch_to_english() 완료 후 호출
@@ -117,14 +129,19 @@ fn is_korean_english_submode(id: &str) -> bool {
     is_korean_input_source_id(id) && contains_ascii_case_insensitive(id, "roman")
 }
 
-/// 현재 영문 입력 소스인지 확인 (캐시 활용)
+/// 현재 영문 입력 소스인지 확인 (TTL 기반 캐시 활용)
 pub fn is_english_input_source() -> bool {
-    // 캐시가 유효하면 atomic 읽기만으로 즉시 반환
+    // 캐시가 유효하고 TTL 이내이면 atomic 읽기만으로 즉시 반환
     if INPUT_SOURCE_CACHE_VALID.load(Ordering::Acquire) {
-        return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
+        let cached_time = INPUT_SOURCE_CACHE_TIME.load(Ordering::Acquire);
+        let now = current_time_ms();
+        if now.saturating_sub(cached_time) < INPUT_SOURCE_CACHE_TTL_MS {
+            return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
+        }
+        // TTL 만료 — 재조회
     }
 
-    // 캐시 미스 — TIS API 호출 후 캐시 갱신
+    // 캐시 미스 또는 TTL 만료 — TIS API 호출 후 캐시 갱신
     let is_english = if let Some(id) = get_current_input_source_id() {
         // 한글 IME 영문 서브모드(A 모드)는 영문으로 취급
         !is_korean_input_source_id(&id) || is_korean_english_submode(&id)
@@ -133,6 +150,7 @@ pub fn is_english_input_source() -> bool {
     };
 
     INPUT_SOURCE_IS_ENGLISH.store(is_english, Ordering::Release);
+    INPUT_SOURCE_CACHE_TIME.store(current_time_ms(), Ordering::Release);
     INPUT_SOURCE_CACHE_VALID.store(true, Ordering::Release);
     is_english
 }
