@@ -720,7 +720,17 @@ fn trigger_realtime_conversion(state: &EventTapState) -> bool {
         if !detector.should_convert_realtime(buffer.get()) {
             return false;
         }
+        // 구조적 유효성 검사 — 실패 시 버퍼를 유지하여 Stage 2로 폴백
         let content = buffer.get().to_string();
+        let converted = crate::core::converter::convert(&content);
+        if converted == content
+            || crate::detection::validator::has_incomplete_jamo(&converted)
+            || !crate::ngram::check_syllable_structure(&converted)
+            || converted.chars().count() <= 1
+        {
+            return false;
+        }
+
         buffer.clear();
         content
     };

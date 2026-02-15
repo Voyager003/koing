@@ -18,8 +18,8 @@ use std::time::Duration;
 
 /// 워커 스레드가 처리할 작업 항목
 enum WorkItem {
-    /// 영문→한글 변환 (버퍼 내용)
-    Convert(String),
+    /// 영문→한글 변환 (버퍼 내용, 수동 변환 여부)
+    Convert(String, bool),
     /// Undo (한글 텍스트, 원본 영문)
     Undo(String, String),
 }
@@ -81,17 +81,21 @@ fn main() {
 
         while let Ok(item) = work_rx.recv() {
             match item {
-                WorkItem::Convert(buffer) => {
+                WorkItem::Convert(buffer, is_manual) => {
                     let result = validator.analyze(&buffer);
-
-                    if !result.should_convert {
-                        continue;
-                    }
                     let hangul = result.converted;
 
-                    // 한 글자 변환은 오탐 가능성이 높으므로 차단 (ex: rk→가, fn→루)
-                    if hangul.chars().count() <= 1 {
+                    // 변환 불가능 (원본과 동일)
+                    if hangul == buffer {
                         continue;
+                    }
+
+                    if !is_manual {
+                        // 자동 변환: 이벤트 탭에서 구조적 검증 완료됨
+                        // 최소한의 안전장치만 적용
+                        if hangul.chars().count() <= 1 {
+                            continue;
+                        }
                     }
 
                     // 텍스트 교체 중 플래그 설정 (실시간 변환 레이스 방지)
@@ -149,8 +153,8 @@ fn main() {
     // 콜백은 이벤트 탭 스레드에서 호출되므로, 워커에 전송만 하여
     // 이벤트 탭이 macOS에 의해 비활성화되지 않도록 함
     let convert_tx = work_tx.clone();
-    event_state.set_convert_callback(move |buffer: String, _is_manual: bool| {
-        let _ = convert_tx.send(WorkItem::Convert(buffer));
+    event_state.set_convert_callback(move |buffer: String, is_manual: bool| {
+        let _ = convert_tx.send(WorkItem::Convert(buffer, is_manual));
     });
 
     // Undo 콜백 설정

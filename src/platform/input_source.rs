@@ -264,50 +264,42 @@ fn verify_switch(expected_check: impl Fn(&str) -> bool) -> bool {
         .unwrap_or(false)
 }
 
-/// 한글 입력 소스로 전환 (검증 실패 시 1회 재시도)
+/// 한글 입력 소스로 전환 (캐시 실패 시 리스트 검색 폴백)
 pub fn switch_to_korean() -> Result<(), String> {
-    // 이미 한글이면 전환 불필요
+    // 한글 타이핑 모드 검증 함수 (Korean.Roman 영문 서브모드 제외)
+    let is_korean_typing_mode =
+        |id: &str| is_korean_input_source_id(id) && !is_korean_english_submode(id);
+
+    // 이미 한글 타이핑 모드이면 전환 불필요
+    // Korean.Roman(영문 서브모드)은 영문으로 취급하여 전환 수행
     if let Some(id) = get_current_input_source_id() {
-        if is_korean_input_source_id(&id) {
+        if is_korean_typing_mode(&id) {
             return Ok(());
         }
     }
 
-    for attempt in 0..2 {
-        // 캐싱된 소스로 즉시 전환 (리스트 순회 없음)
-        let result = if let Some(source) = get_cached_korean_source() {
-            let ret = unsafe { TISSelectInputSource(source) };
-            if ret == 0 {
-                Ok(())
-            } else {
-                Err(format!("TISSelectInputSource 실패: 오류 코드 {}", ret))
-            }
-        } else {
-            // 캐시 실패 시 폴백
-            switch_to_input_source(KOREAN_INPUT_SOURCE_ID)
-        };
-
-        if result.is_err() {
-            invalidate_input_source_cache();
-            return result;
-        }
-
-        // Sonoma+에서 전환 완료 검증
-        if verify_switch(|id| is_korean_input_source_id(id)) {
+    // 1차 시도: 캐싱된 소스로 빠른 전환
+    if let Some(source) = get_cached_korean_source() {
+        let ret = unsafe { TISSelectInputSource(source) };
+        if ret == 0 && verify_switch(&is_korean_typing_mode) {
             invalidate_input_source_cache();
             return Ok(());
         }
+        log::warn!("캐시 소스 한글 전환 실패 (ret={}), 리스트 검색으로 재시도", ret);
+    }
 
-        if attempt == 0 {
-            log::warn!("한글 전환 검증 실패, 재시도...");
-            thread::sleep(Duration::from_millis(50));
+    // 2차 시도: 입력 소스 리스트에서 직접 검색 (캐시 stale 대응)
+    thread::sleep(Duration::from_millis(50));
+    if let Ok(()) = switch_to_input_source(KOREAN_INPUT_SOURCE_ID) {
+        if verify_switch(&is_korean_typing_mode) {
+            invalidate_input_source_cache();
+            return Ok(());
         }
     }
 
-    // 재시도 후에도 검증 실패
+    // 최종 실패
     invalidate_input_source_cache();
-    log::warn!("한글 전환 검증 실패 — 전환이 지연되었을 수 있음");
-    Ok(())
+    Err("한글 전환 최종 실패: 캐시 및 리스트 검색 모두 실패".to_string())
 }
 
 /// 영문 입력 소스 참조를 캐싱 (최초 1회만 검색, ABC 또는 US)
