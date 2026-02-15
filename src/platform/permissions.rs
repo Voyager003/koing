@@ -56,6 +56,31 @@ pub fn wait_for_accessibility_permission(timeout: Duration) -> bool {
     false
 }
 
+/// TCC 데이터베이스에서 Accessibility 권한 항목 초기화
+/// 재설치/업그레이드 시 이전 빌드의 코드 서명에 연결된 stale TCC 항목을 제거하여
+/// 새 빌드에 대한 권한 요청이 정상 작동하도록 함
+pub fn reset_accessibility_permission() {
+    let result = std::process::Command::new("tccutil")
+        .args(["reset", "Accessibility", "com.koing.app"])
+        .output();
+
+    match result {
+        Ok(output) => {
+            if output.status.success() {
+                log::warn!("TCC Accessibility 권한 초기화 완료 (stale 항목 제거)");
+            } else {
+                log::warn!(
+                    "TCC 초기화 실패: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        Err(e) => {
+            log::warn!("tccutil 실행 실패: {}", e);
+        }
+    }
+}
+
 /// 권한 상태를 사람이 읽을 수 있는 문자열로 반환
 pub fn permission_status_string() -> &'static str {
     if check_accessibility_permission() {
