@@ -129,6 +129,12 @@ fn get_delegate_class() -> &'static Class {
 
 /// 설정 윈도우 표시 (없으면 생성, 있으면 앞으로 가져오기)
 pub fn show_settings_window() {
+    // 설정 윈도우를 열 때 대기 중인 변환 타이머를 취소하여
+    // 합성 이벤트(backspace+paste)가 설정 윈도우에 전송되는 것을 방지
+    if let Some(state) = EVENT_STATE.get() {
+        state.cancel_pending_conversion();
+    }
+
     let mut window_guard = SETTINGS_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
 
     // 기존 윈도우가 있으면 앞으로 가져오기

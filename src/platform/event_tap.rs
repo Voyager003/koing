@@ -1,7 +1,7 @@
 //! CGEventTap을 사용한 키보드 이벤트 감지
 
 use crate::detection::AutoDetector;
-use crate::platform::input_source::{invalidate_input_source_cache, is_english_input_source, switch_to_korean};
+use crate::platform::input_source::{invalidate_input_source_cache, is_english_input_source, switch_to_korean_on_main};
 use crate::platform::text_replacer::KOING_SYNTHETIC_EVENT_MARKER;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
@@ -507,6 +507,14 @@ impl EventTapState {
         self.run_loop.store(rl, Ordering::Release);
     }
 
+    /// 버퍼 초기화 및 타이머 취소 (설정 윈도우 등 외부에서 사용)
+    /// 합성 이벤트가 의도하지 않은 윈도우에 전송되는 것을 방지
+    pub fn cancel_pending_conversion(&self) {
+        lock_or_recover(&self.buffer).clear();
+        self.send_debounce_command(DebounceCommand::Cancel);
+        self.send_switch_command(SwitchCommand::Cancel);
+    }
+
     /// 이벤트 탭 종료 — 타이머 스레드 정지 + CFRunLoop 정지
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
@@ -686,11 +694,9 @@ fn start_switch_timer(state: Arc<EventTapState>) {
                 continue;
             }
 
-            // 타이머 만료 — 한글 전환
+            // 타이머 만료 — 한글 전환 (메인 스레드에서 실행)
             if !switch_fired {
-                if let Err(e) = switch_to_korean() {
-                    log::warn!("[SwitchTimer] 한글 전환 실패: {}", e);
-                }
+                switch_to_korean_on_main();
                 switch_fired = true;
             }
             deadline = None;

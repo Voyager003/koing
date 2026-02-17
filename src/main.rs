@@ -4,7 +4,7 @@ use koing::config::load_config;
 use koing::ngram::KoreanValidator;
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
-    input_source::switch_to_korean,
+    input_source::switch_to_korean_on_main,
     os_version::{get_macos_version, is_sonoma_or_later},
     permissions::{check_accessibility_permission, request_accessibility_permission, reset_accessibility_permission, wait_for_accessibility_permission},
     text_replacer::{replace_text, undo_replace_text},
@@ -118,9 +118,8 @@ fn main() {
                     thread::sleep(Duration::from_millis(200));
 
                     // 한글 자판 전환 (is_replacing=true 상태에서 수행)
-                    if let Err(e) = switch_to_korean() {
-                        log::warn!("한글 전환 실패: {}", e);
-                    }
+                    // 메인 스레드에서 실행하여 포커스된 앱의 입력 모드 실제 변경 보장
+                    switch_to_korean_on_main();
 
                     event_state_for_worker
                         .is_replacing

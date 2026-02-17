@@ -1,7 +1,7 @@
 //! macOS 메뉴바 앱 (NSStatusBar)
 #![allow(deprecated)] // cocoa 크레이트 deprecated API 사용
 
-use crate::config::{save_config, KoingConfig};
+use crate::config::{load_config, save_config, KoingConfig};
 use crate::platform::event_tap::EventTapState;
 use cocoa::appkit::{
     NSApp, NSApplication, NSApplicationActivationPolicyAccessory, NSMenu, NSMenuItem, NSStatusBar,
@@ -52,12 +52,12 @@ const DEBOUNCE_LABELS: [&str; 4] = [
 
 // --- 자판 전환 (switch) ---
 static SWITCH_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
-const SWITCH_PRESETS: [u64; 4] = [0, 500, 1000, 2000];
+const SWITCH_PRESETS: [u64; 4] = [0, 10, 30, 50];
 const SWITCH_LABELS: [&str; 4] = [
-    "사용 안함",
-    "빠름 (0.5초)",
-    "보통 (1초)",
-    "느림 (2초)",
+    "즉시 (0ms)",
+    "빠름 (10ms)",
+    "보통 (30ms)",
+    "느림 (50ms)",
 ];
 
 // --- 느린 변환 (slow debounce) ---
@@ -71,10 +71,11 @@ const SLOW_DEBOUNCE_LABELS: [&str; 4] = [
 ];
 
 /// 현재 설정 읽어서 KoingConfig 구성
+/// 기존 설정 파일을 로드하여 paste_delay_ms 등 미관리 필드를 보존
 pub fn current_config() -> KoingConfig {
     match EVENT_STATE.get() {
         Some(state) => {
-            let mut config = KoingConfig::default();
+            let mut config = load_config();
             config.enabled = state.is_enabled();
             config.debounce_ms = state.get_debounce_ms();
             config.switch_delay_ms = state.get_switch_delay_ms();

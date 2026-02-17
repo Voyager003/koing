@@ -237,31 +237,34 @@ fn get_cached_korean_source() -> Option<TISInputSourceRef> {
     if ptr == 0 { None } else { Some(ptr as TISInputSourceRef) }
 }
 
-/// 입력 소스 전환 후 실제로 전환되었는지 검증 (Sonoma+ 대응)
-/// Sonoma/Sequoia에서 TISSelectInputSource가 비동기로 동작할 수 있음
+/// 입력 소스 전환 후 실제로 전환되었는지 검증
+/// 모든 macOS 버전에서 실제 확인 수행 (dispatch_to_main 사용 시 비동기 가능)
 fn verify_switch(expected_check: impl Fn(&str) -> bool) -> bool {
-    if !is_sonoma_or_later() {
-        // Ventura 이하에서는 동기 전환이므로 검증 불필요
-        return true;
+    // 즉시 확인 (동기 전환 케이스)
+    if let Some(id) = get_current_input_source_id() {
+        if expected_check(&id) {
+            return true;
+        }
     }
 
-    const POLL_INTERVAL_MS: u64 = 10;
-    const MAX_WAIT_MS: u64 = 150;
-    let max_tries = MAX_WAIT_MS / POLL_INTERVAL_MS;
+    let (poll_interval_ms, max_wait_ms) = if is_sonoma_or_later() {
+        (10, 150)
+    } else {
+        (5, 50) // Ventura: 보통 동기 전환이므로 짧은 대기
+    };
+
+    let max_tries = max_wait_ms / poll_interval_ms;
 
     for _ in 0..max_tries {
+        thread::sleep(Duration::from_millis(poll_interval_ms));
         if let Some(id) = get_current_input_source_id() {
             if expected_check(&id) {
                 return true;
             }
         }
-        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
 
-    // 마지막 확인
-    get_current_input_source_id()
-        .map(|id| expected_check(&id))
-        .unwrap_or(false)
+    false
 }
 
 /// 한글 입력 소스로 전환 (캐시 실패 시 리스트 검색 폴백)
@@ -285,7 +288,8 @@ pub fn switch_to_korean() -> Result<(), String> {
             invalidate_input_source_cache();
             return Ok(());
         }
-        log::warn!("캐시 소스 한글 전환 실패 (ret={}), 리스트 검색으로 재시도", ret);
+        let current_id = get_current_input_source_id().unwrap_or_else(|| "unknown".to_string());
+        log::warn!("캐시 소스 한글 전환 실패 (ret={}, current={}), 리스트 검색으로 재시도", ret, current_id);
     }
 
     // 2차 시도: 입력 소스 리스트에서 직접 검색 (캐시 stale 대응)
@@ -300,6 +304,18 @@ pub fn switch_to_korean() -> Result<(), String> {
     // 최종 실패
     invalidate_input_source_cache();
     Err("한글 전환 최종 실패: 캐시 및 리스트 검색 모두 실패".to_string())
+}
+
+/// 메인 스레드에서 한글 입력 소스로 전환
+/// TISSelectInputSource()는 메인 RunLoop이 있는 스레드에서 호출해야
+/// 포커스된 앱의 실제 입력 모드가 변경됨.
+/// Worker/timer 스레드에서 직접 호출하면 메뉴바만 바뀌고 실제 입력은 영문 유지.
+pub fn switch_to_korean_on_main() {
+    crate::platform::dispatch_to_main(|| {
+        if let Err(e) = switch_to_korean() {
+            log::warn!("한글 전환 실패 (main thread): {}", e);
+        }
+    });
 }
 
 /// 영문 입력 소스 참조를 캐싱 (최초 1회만 검색, ABC 또는 US)
