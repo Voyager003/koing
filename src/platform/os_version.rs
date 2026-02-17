@@ -116,7 +116,7 @@ mod tests {
         let v13 = MacOSVersion { major: 13, minor: 6, patch: 0 };
         let v14 = MacOSVersion { major: 14, minor: 0, patch: 0 };
         let v15 = MacOSVersion { major: 15, minor: 1, patch: 0 };
-        assert!(!v13.major >= 14 || v13.major >= 14); // 개별 값 테스트
+        assert!(v13.major < 14);  // Ventura는 Sonoma 미만
         assert!(v14.major >= 14);
         assert!(v15.major >= 14);
     }

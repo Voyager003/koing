@@ -65,6 +65,11 @@ impl KeyBuffer {
         self.buffer.is_empty()
     }
 
+    /// 마지막 문자 제거 (Backspace 처리용)
+    pub fn pop(&mut self) -> Option<char> {
+        self.buffer.pop()
+    }
+
     /// 마지막 n개의 문자 삭제 후 새 문자열 추가
     pub fn replace_last(&mut self, remove_count: usize, new_text: &str) {
         for _ in 0..remove_count {
@@ -183,43 +188,7 @@ fn keycode_to_char(keycode: u16, shift: bool) -> Option<char> {
 
 /// 두벌식 자판에서 자음/모음으로 매핑되는 키인지 확인
 fn is_hangul_key(c: char) -> bool {
-    // 두벌식 자음 키
-    const CONSONANT_KEYS: &[char] = &[
-        'r', 'R', // ㄱ, ㄲ
-        's', // ㄴ
-        'e', 'E', // ㄷ, ㄸ
-        'f', // ㄹ
-        'a', // ㅁ
-        'q', 'Q', // ㅂ, ㅃ
-        't', 'T', // ㅅ, ㅆ
-        'd', // ㅇ
-        'w', 'W', // ㅈ, ㅉ
-        'c', // ㅊ
-        'z', // ㅋ
-        'x', // ㅌ
-        'v', // ㅍ
-        'g', // ㅎ
-    ];
-
-    // 두벌식 모음 키
-    const VOWEL_KEYS: &[char] = &[
-        'k', // ㅏ
-        'o', // ㅐ
-        'i', // ㅑ
-        'O', // ㅒ
-        'j', // ㅓ
-        'p', // ㅔ
-        'u', // ㅕ
-        'P', // ㅖ
-        'h', // ㅗ
-        'y', // ㅛ
-        'n', // ㅜ
-        'b', // ㅠ
-        'm', // ㅡ
-        'l', // ㅣ
-    ];
-
-    CONSONANT_KEYS.contains(&c) || VOWEL_KEYS.contains(&c)
+    crate::core::jamo_mapper::map_to_jamo(c).is_some()
 }
 
 /// 단축키 설정
@@ -1001,6 +970,18 @@ fn handle_event(
             // 일반 키 입력 처리
             let shift_pressed = flags.contains(CGEventFlags::CGEventFlagShift);
 
+            // Backspace: 버퍼에서 마지막 문자 제거
+            if keycode == 51 {
+                let mut buffer = lock_or_recover(&state.buffer);
+                buffer.pop();
+                if buffer.is_empty() {
+                    state.send_debounce_command(DebounceCommand::Cancel);
+                } else if state.is_realtime_mode() {
+                    state.send_debounce_command(DebounceCommand::Reset);
+                }
+                return Some(event.clone());
+            }
+
             // 버퍼 초기화 조건: Tab, Escape, 방향키
             if matches!(keycode, 48 | 53 | 123..=126) {
                 lock_or_recover(&state.buffer).clear();
@@ -1117,6 +1098,14 @@ fn handle_event(
         CGEventType::FlagsChanged => {
             // 수정키 변경 시 입력 소스 캐시 무효화
             invalidate_input_source_cache();
+
+            // Cmd 키 감지: 앱 전환(Cmd+Tab) 등에 의한 버퍼 오염 방지
+            let flags = event.get_flags();
+            if flags.contains(CGEventFlags::CGEventFlagCommand) {
+                lock_or_recover(&state.buffer).clear();
+                state.send_debounce_command(DebounceCommand::Cancel);
+                state.send_switch_command(SwitchCommand::Cancel);
+            }
 
             Some(event.clone())
         }

@@ -306,7 +306,7 @@ pub fn switch_to_korean() -> Result<(), String> {
     Err("한글 전환 최종 실패: 캐시 및 리스트 검색 모두 실패".to_string())
 }
 
-/// 메인 스레드에서 한글 입력 소스로 전환
+/// 메인 스레드에서 한글 입력 소스로 전환 (비동기)
 /// TISSelectInputSource()는 메인 RunLoop이 있는 스레드에서 호출해야
 /// 포커스된 앱의 실제 입력 모드가 변경됨.
 /// Worker/timer 스레드에서 직접 호출하면 메뉴바만 바뀌고 실제 입력은 영문 유지.
@@ -314,6 +314,17 @@ pub fn switch_to_korean_on_main() {
     crate::platform::dispatch_to_main(|| {
         if let Err(e) = switch_to_korean() {
             log::warn!("한글 전환 실패 (main thread): {}", e);
+        }
+    });
+}
+
+/// 메인 스레드에서 한글 입력 소스로 전환 (동기 — 전환 완료까지 블록)
+/// 변환 직후 is_replacing 해제 전에 사용하여, 전환 완료 전 키 입력이
+/// 영문으로 처리되는 레이스 컨디션을 방지합니다.
+pub fn switch_to_korean_on_main_sync() {
+    crate::platform::dispatch_to_main_sync(|| {
+        if let Err(e) = switch_to_korean() {
+            log::warn!("한글 전환 실패 (main thread sync): {}", e);
         }
     });
 }

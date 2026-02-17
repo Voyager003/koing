@@ -42,36 +42,16 @@ static STATUS_ITEM: Mutex<SendId> = Mutex::new(SendId::NULL);
 /// "Koing 활성화" 토글 메뉴 아이템
 static TOGGLE_MENU_ITEM: Mutex<SendId> = Mutex::new(SendId::NULL);
 static DEBOUNCE_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
-const DEBOUNCE_PRESETS: [u64; 4] = [200, 300, 500, 800];
-const DEBOUNCE_LABELS: [&str; 4] = [
-    "빠름 (200ms)",
-    "보통 (300ms)",
-    "느림 (500ms)",
-    "여유 (800ms)",
-];
-
-// --- 자판 전환 (switch) ---
 static SWITCH_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
-const SWITCH_PRESETS: [u64; 4] = [0, 10, 30, 50];
-const SWITCH_LABELS: [&str; 4] = [
-    "즉시 (0ms)",
-    "빠름 (10ms)",
-    "보통 (30ms)",
-    "느림 (50ms)",
-];
-
-// --- 느린 변환 (slow debounce) ---
 static SLOW_DEBOUNCE_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
-const SLOW_DEBOUNCE_PRESETS: [u64; 4] = [1000, 1500, 2000, 3000];
-const SLOW_DEBOUNCE_LABELS: [&str; 4] = [
-    "빠름 (1초)",
-    "보통 (1.5초)",
-    "느림 (2초)",
-    "여유 (3초)",
-];
+
+use super::{
+    DEBOUNCE_LABELS, DEBOUNCE_PRESETS,
+    SLOW_DEBOUNCE_LABELS, SLOW_DEBOUNCE_PRESETS,
+    SWITCH_LABELS, SWITCH_PRESETS,
+};
 
 /// 현재 설정 읽어서 KoingConfig 구성
-/// 기존 설정 파일을 로드하여 paste_delay_ms 등 미관리 필드를 보존
 pub fn current_config() -> KoingConfig {
     match EVENT_STATE.get() {
         Some(state) => {
@@ -478,13 +458,6 @@ impl MenuBarApp {
         }
     }
 
-    pub fn set_title(&self, title: &str) {
-        unsafe {
-            let ns_title = NSString::alloc(nil).init_str(title);
-            let _: () = msg_send![self.status_item, setTitle: ns_title];
-        }
-    }
-
     pub fn run(&self) {
         unsafe {
             let app = NSApp();
@@ -503,10 +476,3 @@ impl Drop for MenuBarApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_placeholder() {
-        assert!(true);
-    }
-}

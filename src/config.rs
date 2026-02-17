@@ -16,9 +16,6 @@ pub struct KoingConfig {
     /// 자동 변환 후 한글 자판 전환까지 대기 시간 (ms)
     #[serde(default = "default_switch_delay_ms")]
     pub switch_delay_ms: u64,
-    /// 붙여넣기 후 클립보드 복원까지 대기 시간 (ms)
-    #[serde(default = "default_paste_delay_ms")]
-    pub paste_delay_ms: u64,
     /// 느린 변환 대기 시간 (ms) — N-gram 점수가 낮지만 유효한 한글용
     #[serde(default = "default_slow_debounce_ms")]
     pub slow_debounce_ms: u64,
@@ -36,10 +33,6 @@ fn default_switch_delay_ms() -> u64 {
     1500
 }
 
-fn default_paste_delay_ms() -> u64 {
-    500
-}
-
 fn default_slow_debounce_ms() -> u64 {
     1500
 }
@@ -50,7 +43,6 @@ impl Default for KoingConfig {
             enabled: default_enabled(),
             debounce_ms: default_debounce_ms(),
             switch_delay_ms: default_switch_delay_ms(),
-            paste_delay_ms: default_paste_delay_ms(),
             slow_debounce_ms: default_slow_debounce_ms(),
         }
     }
@@ -111,7 +103,6 @@ mod tests {
             enabled: true,
             debounce_ms: 150,
             switch_delay_ms: 50,
-            paste_delay_ms: 500,
             slow_debounce_ms: 1500,
         };
         let json = serde_json::to_string(&config).unwrap();

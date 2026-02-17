@@ -129,9 +129,7 @@ fn jongseong_to_eng(jong: u32, result: &mut String) {
     match jong {
         0 => {} // 종성 없음
         1 => result.push('r'),  // ㄱ
-        2 => result.push_str("RR"), // ㄲ (실제로 R 한 번 입력 -> ㄲ이지만, 종성에서는 rr로 표현될 수도 있음)
-        // 실제 두벌식에서 종성 ㄲ은 'R' 또는 'rr'로 입력 가능
-        // 여기서는 단일 문자로 표현
+        2 => result.push('R'), // ㄲ (Shift+R 한 번)
         3 => {
             // ㄳ = ㄱ + ㅅ
             result.push('r');

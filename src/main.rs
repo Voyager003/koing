@@ -4,7 +4,7 @@ use koing::config::load_config;
 use koing::ngram::KoreanValidator;
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
-    input_source::switch_to_korean_on_main,
+    input_source::switch_to_korean_on_main_sync,
     os_version::{get_macos_version, is_sonoma_or_later},
     permissions::{check_accessibility_permission, request_accessibility_permission, reset_accessibility_permission, wait_for_accessibility_permission},
     text_replacer::{replace_text, undo_replace_text},
@@ -57,6 +57,7 @@ fn main() {
         eprintln!("   에서 이 앱을 허용해주세요.");
         eprintln!();
         eprintln!("권한을 허용한 후 앱을 다시 실행해주세요.");
+        std::process::exit(1);
     }
 
     // 설정 로드
@@ -91,9 +92,11 @@ fn main() {
                     }
 
                     if !is_manual {
-                        // 자동 변환: 이벤트 탭에서 구조적 검증 완료됨
-                        // 최소한의 안전장치만 적용
+                        // 자동 변환: 음절구조/n-gram 2차 검증
                         if hangul.chars().count() <= 1 {
+                            continue;
+                        }
+                        if !result.should_convert {
                             continue;
                         }
                     }
@@ -117,9 +120,10 @@ fn main() {
                     // paste 처리 완료 대기 (is_replacing=true 유지하여 이벤트 탭 간섭 차단)
                     thread::sleep(Duration::from_millis(200));
 
-                    // 한글 자판 전환 (is_replacing=true 상태에서 수행)
-                    // 메인 스레드에서 실행하여 포커스된 앱의 입력 모드 실제 변경 보장
-                    switch_to_korean_on_main();
+                    // 한글 자판 전환 (is_replacing=true 상태에서 동기 실행)
+                    // 메인 스레드에서 완료될 때까지 블록하여, 전환 전 키 입력이
+                    // 영문으로 처리되는 레이스 컨디션 방지
+                    switch_to_korean_on_main_sync();
 
                     event_state_for_worker
                         .is_replacing

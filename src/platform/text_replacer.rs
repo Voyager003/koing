@@ -65,10 +65,8 @@ fn timing() -> &'static TimingProfile {
     TIMING.get_or_init(TimingProfile::for_current_os)
 }
 
-lazy_static::lazy_static! {
-    /// 클립보드 작업 직렬화를 위한 글로벌 Mutex
-    static ref CLIPBOARD_MUTEX: Mutex<()> = Mutex::new(());
-}
+/// 클립보드 작업 직렬화를 위한 글로벌 Mutex
+static CLIPBOARD_MUTEX: Mutex<()> = Mutex::new(());
 
 /// 클립보드 복원 세대 카운터 — 최신 변환만 복원 수행
 static RESTORE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -100,9 +98,10 @@ impl ClipboardBackup {
 pub fn get_clipboard_string() -> Option<String> {
     unsafe {
         let pasteboard: id = NSPasteboard::generalPasteboard(nil);
-        let types: id =
-            NSArray::arrayWithObject(nil, NSString::alloc(nil).init_str("public.utf8-plain-text"));
+        let type_str: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
+        let types: id = NSArray::arrayWithObject(nil, type_str);
         let available: id = msg_send![pasteboard, availableTypeFromArray: types];
+        let _: () = msg_send![type_str, release];
 
         if available == nil {
             return None;
@@ -132,12 +131,16 @@ pub fn set_clipboard_string(content: &str) {
         let pasteboard: id = NSPasteboard::generalPasteboard(nil);
         let _: () = msg_send![pasteboard, clearContents];
 
-        let ns_string = NSString::alloc(nil).init_str(content);
-        let types =
-            NSArray::arrayWithObject(nil, NSString::alloc(nil).init_str("public.utf8-plain-text"));
+        let ns_string: id = NSString::alloc(nil).init_str(content);
+        let type_str: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
+        let types: id = NSArray::arrayWithObject(nil, type_str);
 
         let _: () = msg_send![pasteboard, declareTypes: types owner: nil];
-        let _: () = msg_send![pasteboard, setString: ns_string forType: NSString::alloc(nil).init_str("public.utf8-plain-text")];
+        let for_type: id = NSString::alloc(nil).init_str("public.utf8-plain-text");
+        let _: () = msg_send![pasteboard, setString: ns_string forType: for_type];
+        let _: () = msg_send![for_type, release];
+        let _: () = msg_send![type_str, release];
+        let _: () = msg_send![ns_string, release];
     }
 }
 

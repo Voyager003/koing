@@ -32,8 +32,9 @@ fn is_rare_onset(cho: u32, jung: u32) -> bool {
         return true;
     }
 
-    // Rule 5: 특정 초성 + ㅑ(2) — 먀(6),뱌(7),챠(14),캬(15),탸(16),퍄(17)
-    if jung == 2 && matches!(cho, 6 | 7 | 14 | 15 | 16 | 17) {
+    // Rule 5: ㅑ(2) — 허용: 갸(0), 냐(2), 샤(9), 야(11) 만 자연스러움
+    // 쟈(12), 랴(5), 먀(6), 뱌(7), 챠(14), 캬(15), 탸(16), 퍄(17) 등 차단
+    if jung == 2 && !matches!(cho, 0 | 2 | 9 | 11) {
         return true;
     }
 
@@ -125,9 +126,20 @@ mod tests {
         assert!(is_rare_onset(1, 2)); // ㄲ+ㅑ — rare
         assert!(is_rare_onset(4, 7)); // ㄸ+ㅖ — rare
 
-        // Rule 5: 특정 초성 + ㅑ
+        // Rule 5: ㅑ — 화이트리스트 (갸, 냐, 샤, 야만 허용)
         assert!(is_rare_onset(6, 2)); // 먀 — rare
         assert!(is_rare_onset(17, 2)); // 퍄 — rare
+        assert!(is_rare_onset(12, 2)); // 쟈 — rare
+        assert!(is_rare_onset(5, 2)); // 랴 — rare
         assert!(!is_rare_onset(0, 2)); // 갸 — not rare
+        assert!(!is_rare_onset(2, 2)); // 냐 — not rare
+        assert!(!is_rare_onset(9, 2)); // 샤 — not rare
+        assert!(!is_rare_onset(11, 2)); // 야 — not rare
+    }
+
+    #[test]
+    fn test_wifi_blocked() {
+        // "wifi" → "쟈랴" — 쟈(ㅈ+ㅑ), 랴(ㄹ+ㅑ) 모두 희귀 → 연속 2개로 차단
+        assert!(!check_syllable_structure("쟈랴"));
     }
 }

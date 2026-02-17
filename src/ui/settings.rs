@@ -12,6 +12,11 @@ use objc::{class, msg_send, sel, sel_impl};
 use std::sync::{Mutex, OnceLock};
 
 use super::menubar::EVENT_STATE;
+use super::{
+    DEBOUNCE_LABELS, DEBOUNCE_PRESETS,
+    SLOW_DEBOUNCE_LABELS, SLOW_DEBOUNCE_PRESETS,
+    SWITCH_LABELS, SWITCH_PRESETS,
+};
 
 /// 설정 윈도우 참조 (재사용)
 struct SendId(id);
@@ -22,18 +27,6 @@ static SETTINGS_WINDOW: Mutex<Option<SendId>> = Mutex::new(None);
 /// delegate 참조를 유지하여 해제 방지 (NSControl.target은 unretained)
 static SETTINGS_DELEGATE: Mutex<Option<SendId>> = Mutex::new(None);
 static SETTINGS_DELEGATE_CLASS: OnceLock<&'static Class> = OnceLock::new();
-
-// 변환 속도 프리셋
-const DEBOUNCE_PRESETS: [u64; 4] = [200, 300, 500, 800];
-const DEBOUNCE_LABELS: [&str; 4] = ["빠름 (200ms)", "보통 (300ms)", "느림 (500ms)", "여유 (800ms)"];
-
-// 자판 전환 프리셋
-const SWITCH_PRESETS: [u64; 4] = [0, 10, 30, 50];
-const SWITCH_LABELS: [&str; 4] = ["즉시 (0ms)", "빠름 (10ms)", "보통 (30ms)", "느림 (50ms)"];
-
-// 느린 변환 프리셋
-const SLOW_DEBOUNCE_PRESETS: [u64; 4] = [1000, 1500, 2000, 3000];
-const SLOW_DEBOUNCE_LABELS: [&str; 4] = ["빠름 (1초)", "보통 (1.5초)", "느림 (2초)", "여유 (3초)"];
 
 // --- ObjC 액션 핸들러 ---
 
