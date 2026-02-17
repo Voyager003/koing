@@ -129,7 +129,30 @@ fn is_korean_english_submode(id: &str) -> bool {
     is_korean_input_source_id(id) && contains_ascii_case_insensitive(id, "roman")
 }
 
+/// 현재 스레드가 메인 스레드인지 확인
+fn is_main_thread() -> bool {
+    extern "C" {
+        fn pthread_main_np() -> i32;
+    }
+    unsafe { pthread_main_np() != 0 }
+}
+
+/// TIS API를 호출하여 입력 소스 캐시 갱신 (반드시 메인 스레드에서 호출)
+fn refresh_input_source_cache() {
+    let is_english = if let Some(id) = get_current_input_source_id() {
+        !is_korean_input_source_id(&id) || is_korean_english_submode(&id)
+    } else {
+        true
+    };
+    INPUT_SOURCE_IS_ENGLISH.store(is_english, Ordering::Release);
+    INPUT_SOURCE_CACHE_TIME.store(current_time_ms(), Ordering::Release);
+    INPUT_SOURCE_CACHE_VALID.store(true, Ordering::Release);
+}
+
 /// 현재 영문 입력 소스인지 확인 (TTL 기반 캐시 활용)
+///
+/// TIS API(TISCopyCurrentKeyboardInputSource 등)는 macOS 26.2+에서
+/// 메인 큐에서만 호출 가능. 캐시 만료 시 메인 스레드로 디스패치하여 갱신.
 pub fn is_english_input_source() -> bool {
     // 캐시가 유효하고 TTL 이내이면 atomic 읽기만으로 즉시 반환
     if INPUT_SOURCE_CACHE_VALID.load(Ordering::Acquire) {
@@ -141,18 +164,17 @@ pub fn is_english_input_source() -> bool {
         // TTL 만료 — 재조회
     }
 
-    // 캐시 미스 또는 TTL 만료 — TIS API 호출 후 캐시 갱신
-    let is_english = if let Some(id) = get_current_input_source_id() {
-        // 한글 IME 영문 서브모드(A 모드)는 영문으로 취급
-        !is_korean_input_source_id(&id) || is_korean_english_submode(&id)
+    // 캐시 미스 또는 TTL 만료 — TIS API는 메인 스레드에서만 호출
+    if is_main_thread() {
+        refresh_input_source_cache();
     } else {
-        true
-    };
+        // event tap 스레드 등: 메인 스레드에 동기 디스패치
+        crate::platform::dispatch_to_main_sync(|| {
+            refresh_input_source_cache();
+        });
+    }
 
-    INPUT_SOURCE_IS_ENGLISH.store(is_english, Ordering::Release);
-    INPUT_SOURCE_CACHE_TIME.store(current_time_ms(), Ordering::Release);
-    INPUT_SOURCE_CACHE_VALID.store(true, Ordering::Release);
-    is_english
+    INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire)
 }
 
 /// 특정 입력 소스 ID로 전환
