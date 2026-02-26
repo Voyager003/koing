@@ -363,15 +363,44 @@ pub fn switch_to_korean_on_main() {
     });
 }
 
-/// 메인 스레드에서 한글 입력 소스로 전환 (동기 — 전환 완료까지 블록)
+/// 메인 스레드에서 한글 입력 소스로 전환 (타임아웃 포함)
 /// 변환 직후 is_replacing 해제 전에 사용하여, 전환 완료 전 키 입력이
 /// 영문으로 처리되는 레이스 컨디션을 방지합니다.
-pub fn switch_to_korean_on_main_sync() {
-    crate::platform::dispatch_to_main_sync(|| {
+///
+/// dispatch_to_main + Condvar 기반 타임아웃으로 구현하여,
+/// 메인 스레드가 응답 없어도 worker가 영원히 블로킹되지 않습니다.
+///
+/// 반환값: true이면 전환 완료, false이면 타임아웃
+pub fn switch_to_korean_on_main_with_timeout(timeout: std::time::Duration) -> bool {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let pair = Arc::new((Mutex::new(false), Condvar::new()));
+    let pair_clone = Arc::clone(&pair);
+
+    crate::platform::dispatch_to_main(move || {
         if let Err(e) = switch_to_korean() {
-            log::warn!("한글 전환 실패 (main thread sync): {}", e);
+            log::warn!("한글 전환 실패 (main thread): {}", e);
+        }
+        let (lock, cvar) = &*pair_clone;
+        if let Ok(mut completed) = lock.lock() {
+            *completed = true;
+            cvar.notify_one();
         }
     });
+
+    let (lock, cvar) = &*pair;
+    let guard = match lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let (guard, timeout_result) = cvar.wait_timeout_while(guard, timeout, |completed| !*completed)
+        .unwrap_or_else(|e| e.into_inner());
+    let completed = *guard;
+    if timeout_result.timed_out() && !completed {
+        log::warn!("한글 전환 타임아웃 ({:?}), 강제 진행", timeout);
+        return false;
+    }
+    true
 }
 
 /// 영문 입력 소스 참조를 캐싱 (최초 1회만 검색, ABC 또는 US)

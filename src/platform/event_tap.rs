@@ -939,7 +939,9 @@ fn handle_event(
     }
 
     // Koing이 생성한 합성 이벤트는 처리하지 않고 통과
-    if matches!(event_type, CGEventType::KeyDown) {
+    // KeyDown뿐 아니라 FlagsChanged(simulate_paste의 Cmd 키 이벤트 등)도 필터링하여
+    // 텍스트 교체 중 불필요한 캐시 무효화/버퍼 클리어 방지
+    if matches!(event_type, CGEventType::KeyDown | CGEventType::FlagsChanged) {
         let user_data = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
         if user_data == KOING_SYNTHETIC_EVENT_MARKER {
             return Some(event.clone());
@@ -1000,6 +1002,9 @@ fn handle_event(
 
             // Backspace: 버퍼에서 마지막 문자 제거
             if keycode == 51 {
+                // 비문자 키에서도 conversion_just_triggered 리셋
+                // (Space/Enter만 swap으로 이전 값을 확인하므로 여기서는 단순 store)
+                state.conversion_just_triggered.store(false, Ordering::Release);
                 let mut buffer = lock_or_recover(&state.buffer);
                 buffer.pop();
                 if buffer.is_empty() {
@@ -1012,6 +1017,8 @@ fn handle_event(
 
             // 버퍼 초기화 조건: Tab, Escape, 방향키
             if matches!(keycode, 48 | 53 | 123..=126) {
+                // 비문자 키에서도 conversion_just_triggered 리셋
+                state.conversion_just_triggered.store(false, Ordering::Release);
                 lock_or_recover(&state.buffer).clear();
                 state.send_debounce_command(DebounceCommand::Cancel);
                 state.send_switch_command(SwitchCommand::Cancel);

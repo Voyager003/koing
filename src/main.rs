@@ -4,7 +4,7 @@ use koing::config::load_config;
 use koing::ngram::KoreanValidator;
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
-    input_source::switch_to_korean_on_main_sync,
+    input_source::switch_to_korean_on_main_with_timeout,
     os_version::{get_macos_version, is_sonoma_or_later},
     permissions::{check_accessibility_permission, request_accessibility_permission, reset_accessibility_permission, wait_for_accessibility_permission},
     text_replacer::{replace_text, undo_replace_text},
@@ -120,10 +120,11 @@ fn main() {
                     // paste 처리 완료 대기 (is_replacing=true 유지하여 이벤트 탭 간섭 차단)
                     thread::sleep(Duration::from_millis(200));
 
-                    // 한글 자판 전환 (is_replacing=true 상태에서 동기 실행)
-                    // 메인 스레드에서 완료될 때까지 블록하여, 전환 전 키 입력이
-                    // 영문으로 처리되는 레이스 컨디션 방지
-                    switch_to_korean_on_main_sync();
+                    // 한글 자판 전환 (is_replacing=true 상태에서 타임아웃 포함 실행)
+                    // 메인 스레드에서 완료될 때까지 최대 500ms 대기하여,
+                    // 전환 전 키 입력이 영문으로 처리되는 레이스 컨디션 방지.
+                    // 타임아웃 발생 시에도 is_replacing을 해제하여 worker 블로킹 방지.
+                    switch_to_korean_on_main_with_timeout(Duration::from_millis(500));
 
                     event_state_for_worker
                         .is_replacing
