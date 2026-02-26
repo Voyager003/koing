@@ -19,6 +19,8 @@ static INPUT_SOURCE_CACHE_VALID: AtomicBool = AtomicBool::new(false);
 static INPUT_SOURCE_CACHE_TIME: AtomicU64 = AtomicU64::new(0);
 /// 캐시 유효 기간 (ms) — 외부 도구(InputSource Pro 등)의 입력 소스 변경을 감지하기 위한 TTL
 const INPUT_SOURCE_CACHE_TTL_MS: u64 = 100;
+/// 비동기 캐시 갱신 진행 중 여부 (중복 갱신 방지)
+static REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// 현재 시간을 epoch ms로 반환
 fn current_time_ms() -> u64 {
@@ -147,12 +149,31 @@ fn refresh_input_source_cache() {
     INPUT_SOURCE_IS_ENGLISH.store(is_english, Ordering::Release);
     INPUT_SOURCE_CACHE_TIME.store(current_time_ms(), Ordering::Release);
     INPUT_SOURCE_CACHE_VALID.store(true, Ordering::Release);
+    REFRESH_IN_PROGRESS.store(false, Ordering::Release);
+}
+
+/// 비동기 캐시 갱신 스케줄링 (메인 스레드에서 비동기 실행)
+/// 중복 갱신 방지를 위해 REFRESH_IN_PROGRESS 플래그 사용
+pub fn schedule_async_refresh() {
+    // 이미 갱신 진행 중이면 스킵
+    if REFRESH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::platform::dispatch_to_main(|| {
+        refresh_input_source_cache();
+    });
 }
 
 /// 현재 영문 입력 소스인지 확인 (TTL 기반 캐시 활용)
 ///
 /// TIS API(TISCopyCurrentKeyboardInputSource 등)는 macOS 26.2+에서
-/// 메인 큐에서만 호출 가능. 캐시 만료 시 메인 스레드로 디스패치하여 갱신.
+/// 메인 큐에서만 호출 가능.
+///
+/// **비블로킹 정책**: 캐시 만료 시 stale 캐시 값을 즉시 반환하고
+/// 비동기로 갱신을 스케줄링합니다. 이렇게 하면 event tap 콜백에서
+/// dispatch_to_main_sync() 블로킹으로 인한 TapDisabledByTimeout을 방지합니다.
+/// 입력 소스 변경은 드물고 FlagsChanged에서 캐시를 무효화하므로
+/// stale 값이 실제로 틀릴 확률은 매우 낮습니다.
 pub fn is_english_input_source() -> bool {
     // 캐시가 유효하고 TTL 이내이면 atomic 읽기만으로 즉시 반환
     if INPUT_SOURCE_CACHE_VALID.load(Ordering::Acquire) {
@@ -161,17 +182,19 @@ pub fn is_english_input_source() -> bool {
         if now.saturating_sub(cached_time) < INPUT_SOURCE_CACHE_TTL_MS {
             return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
         }
-        // TTL 만료 — 재조회
+        // TTL 만료 — stale 값 반환 + 비동기 갱신
+        schedule_async_refresh();
+        return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
     }
 
-    // 캐시 미스 또는 TTL 만료 — TIS API는 메인 스레드에서만 호출
+    // 캐시 미초기화 상태
     if is_main_thread() {
+        // 메인 스레드: 즉시 동기 갱신 (블로킹 위험 없음)
         refresh_input_source_cache();
     } else {
-        // event tap 스레드 등: 메인 스레드에 동기 디스패치
-        crate::platform::dispatch_to_main_sync(|| {
-            refresh_input_source_cache();
-        });
+        // event tap 스레드 등: 기본값(영문) 반환 + 비동기 갱신
+        schedule_async_refresh();
+        return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
     }
 
     INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire)

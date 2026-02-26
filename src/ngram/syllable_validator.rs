@@ -41,16 +41,58 @@ fn is_rare_onset(cho: u32, jung: u32) -> bool {
     false
 }
 
+/// 종성→초성 전이가 한국어에서 극히 드문지 판별
+///
+/// 종성 idx: 0=없음 1=ㄱ 2=ㄲ 3=ㄳ 4=ㄴ 5=ㄵ 6=ㄶ 7=ㄷ 8=ㄹ 9=ㄺ 10=ㄻ
+///           11=ㄼ 12=ㄽ 13=ㄾ 14=ㄿ 15=ㅀ 16=ㅁ 17=ㅂ 18=ㅄ 19=ㅅ 20=ㅆ
+///           21=ㅇ 22=ㅈ 23=ㅊ 24=ㅋ 25=ㅌ 26=ㅍ 27=ㅎ
+/// 초성 idx: 0=ㄱ 1=ㄲ 2=ㄴ 3=ㄷ 4=ㄸ 5=ㄹ 6=ㅁ 7=ㅂ 8=ㅃ 9=ㅅ 10=ㅆ
+///           11=ㅇ 12=ㅈ 13=ㅉ 14=ㅊ 15=ㅋ 16=ㅌ 17=ㅍ 18=ㅎ
+fn is_rare_transition(prev_jong: u32, next_cho: u32) -> bool {
+    // 종성 없음 → 전이 무관
+    if prev_jong == 0 {
+        return false;
+    }
+
+    // 한국어에서 극히 드문 종성→초성 전이 패턴
+    match (prev_jong, next_cho) {
+        // ㅂ종성(17) → ㅍ초성(17): 극히 드묾
+        (17, 17) => true,
+        // ㄷ종성(7) → ㅌ초성(16): 극히 드묾
+        (7, 16) => true,
+        // ㄱ종성(1) → ㅋ초성(15): 극히 드묾
+        (1, 15) => true,
+        // ㅂ종성(17) → ㅃ초성(8): 극히 드묾
+        (17, 8) => true,
+        // ㄷ종성(7) → ㄸ초성(4): 극히 드묾
+        (7, 4) => true,
+        // ㅈ종성(22) → ㅉ초성(13): 극히 드묾
+        (22, 13) => true,
+        // ㅊ종성(23) → ㅊ초성(14): 극히 드묾
+        (23, 14) => true,
+        // ㅋ종성(24) → ㅋ초성(15): 극히 드묾
+        (24, 15) => true,
+        // ㅌ종성(25) → ㅌ초성(16): 극히 드묾
+        (25, 16) => true,
+        // ㅍ종성(26) → ㅍ초성(17): 극히 드묾
+        (26, 17) => true,
+        _ => false,
+    }
+}
+
 /// 한글 텍스트의 음절 구조 자연스러움 검사
 ///
 /// 연속 희귀 음절 >= 2 또는 희귀 비율 >= 0.5 이면 false (비자연스러움)
+/// 추가: 연속 음절 간 종성→초성 전이 자연스러움 검사
 pub fn check_syllable_structure(text: &str) -> bool {
     let mut consecutive_rare = 0;
     let mut total_syllables = 0;
     let mut rare_count = 0;
+    let mut rare_transitions = 0;
+    let mut prev_jongseong: Option<u32> = None;
 
     for ch in text.chars() {
-        if let Some((cho, jung, _)) = decompose_syllable(ch) {
+        if let Some((cho, jung, jong)) = decompose_syllable(ch) {
             total_syllables += 1;
             if is_rare_onset(cho, jung) {
                 rare_count += 1;
@@ -61,13 +103,32 @@ pub fn check_syllable_structure(text: &str) -> bool {
             } else {
                 consecutive_rare = 0;
             }
+
+            // 종성→초성 전이 검사
+            if let Some(prev_jong) = prev_jongseong {
+                if is_rare_transition(prev_jong, cho) {
+                    rare_transitions += 1;
+                }
+            }
+            prev_jongseong = Some(jong);
         } else {
             // 낱자모 또는 비한글: consecutive 리셋
             consecutive_rare = 0;
+            prev_jongseong = None;
         }
     }
 
     if total_syllables > 0 && (rare_count as f64 / total_syllables as f64) >= 0.5 {
+        return false;
+    }
+
+    // 희귀 전이가 2개 이상이면 비자연스러움
+    if rare_transitions >= 2 {
+        return false;
+    }
+
+    // 3음절 이하에서 희귀 전이 1개이고 희귀 onset도 있으면 거부
+    if total_syllables <= 3 && rare_transitions >= 1 && rare_count >= 1 {
         return false;
     }
 
@@ -141,5 +202,31 @@ mod tests {
     fn test_wifi_blocked() {
         // "wifi" → "쟈랴" — 쟈(ㅈ+ㅑ), 랴(ㄹ+ㅑ) 모두 희귀 → 연속 2개로 차단
         assert!(!check_syllable_structure("쟈랴"));
+    }
+
+    #[test]
+    fn test_rare_transition() {
+        // ㅂ종성→ㅍ초성: 극히 드묾
+        assert!(is_rare_transition(17, 17));
+        // ㄷ종성→ㅌ초성: 극히 드묾
+        assert!(is_rare_transition(7, 16));
+        // ㄱ종성→ㅋ초성: 극히 드묾
+        assert!(is_rare_transition(1, 15));
+        // 종성 없음 → 전이 무관
+        assert!(!is_rare_transition(0, 17));
+        // ㄴ종성→ㅇ초성: 자연스러운 전이
+        assert!(!is_rare_transition(4, 11));
+        // ㄹ종성→ㅇ초성: 자연스러운 전이
+        assert!(!is_rare_transition(8, 11));
+    }
+
+    #[test]
+    fn test_natural_transitions_pass() {
+        // "한글" — ㄴ종성→ㄱ초성: 자연스러움
+        assert!(check_syllable_structure("한글"));
+        // "안녕" — ㄴ종성→ㄴ초성: 자연스러움
+        assert!(check_syllable_structure("안녕"));
+        // "가나다라" — 종성 없음, 전이 검사 스킵
+        assert!(check_syllable_structure("가나다라"));
     }
 }

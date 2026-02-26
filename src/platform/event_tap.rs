@@ -1,7 +1,7 @@
 //! CGEventTap을 사용한 키보드 이벤트 감지
 
 use crate::detection::AutoDetector;
-use crate::platform::input_source::{invalidate_input_source_cache, is_english_input_source, switch_to_korean_on_main};
+use crate::platform::input_source::{invalidate_input_source_cache, is_english_input_source, schedule_async_refresh, switch_to_korean_on_main};
 use crate::platform::text_replacer::KOING_SYNTHETIC_EVENT_MARKER;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
@@ -406,6 +406,7 @@ impl EventTapState {
 
     /// 재시도 + 검증 로직이 포함된 이벤트 탭 재활성화
     /// Sonoma/Sequoia에서는 더 많은 재시도와 딜레이를 사용
+    /// 재시도 전 main RunLoop을 사전 깨워 성공 확률 증가
     fn reenable_tap_with_retry(&self) {
         use crate::platform::os_version::{is_sequoia_or_later, is_sonoma_or_later};
 
@@ -414,10 +415,13 @@ impl EventTapState {
             return;
         }
 
+        // main RunLoop 사전 깨우기 — 유휴 상태에서 깨어나는 시간 단축
+        crate::platform::dispatch_to_main(|| {});
+
         let (initial_delay_ms, max_retries) = if is_sequoia_or_later() {
-            (50, 5)
+            (20, 5)
         } else if is_sonoma_or_later() {
-            (50, 3)
+            (20, 3)
         } else {
             // Ventura 이하: 즉시 1회 시도
             (0, 1)
@@ -427,7 +431,7 @@ impl EventTapState {
             let delay_ms = if attempt == 0 {
                 initial_delay_ms
             } else {
-                // 지수 백오프: 50, 100, 200, 400, ...
+                // 지수 백오프: 20, 40, 80, 160, ...
                 initial_delay_ms * (1u64 << attempt)
             };
 
@@ -794,15 +798,16 @@ fn start_reenable_watcher(state: Arc<EventTapState>) {
 }
 
 /// 이벤트 탭 헬스 모니터링 스레드 시작
-/// 60초 이상 이벤트가 없으면 자동 재활성화 시도
+/// 30초 이상 이벤트가 없으면 자동 재활성화 시도
+/// 10초 이상 무입력 시 CGEventTapIsEnabled() 직접 확인
 fn start_health_monitor(state: Arc<EventTapState>) {
     let state_for_monitor = Arc::clone(&state);
     thread::spawn(move || {
-        // 초기 30초 대기 (앱 시작 직후 이벤트 없는 것은 정상)
-        thread::sleep(Duration::from_secs(30));
+        // 초기 15초 대기 (앱 시작 직후 이벤트 없는 것은 정상)
+        thread::sleep(Duration::from_secs(15));
 
         while state_for_monitor.running.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_secs(30));
+            thread::sleep(Duration::from_secs(15));
 
             let last = state_for_monitor.last_event_time.load(Ordering::Acquire);
             if last == 0 {
@@ -816,7 +821,25 @@ fn start_health_monitor(state: Arc<EventTapState>) {
                 .as_millis() as u64;
 
             let elapsed_sec = (now_ms.saturating_sub(last)) / 1000;
-            if elapsed_sec >= 60 {
+
+            // 10초 이상 무입력 시: 탭 활성화 상태 직접 확인
+            // TapDisabledByTimeout 이벤트 없이도 비활성화를 감지
+            if elapsed_sec >= 10 {
+                let port = state_for_monitor.tap_port.load(Ordering::Acquire);
+                if !port.is_null() {
+                    let enabled = unsafe { CGEventTapIsEnabled(port) };
+                    if !enabled {
+                        log::warn!(
+                            "헬스 모니터: 이벤트 탭 비활성화 감지 ({}초 무입력), 재활성화 시도",
+                            elapsed_sec
+                        );
+                        state_for_monitor.request_reenable();
+                        continue;
+                    }
+                }
+            }
+
+            if elapsed_sec >= 30 {
                 log::warn!(
                     "헬스 모니터: {}초간 이벤트 없음, 이벤트 탭 재활성화 시도",
                     elapsed_sec
@@ -897,7 +920,12 @@ fn handle_event(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    state.last_event_time.store(now_ms, Ordering::Release);
+    let prev_event_time = state.last_event_time.swap(now_ms, Ordering::AcqRel);
+
+    // 유휴→활성 전환 감지: 5초 이상 무입력 후 첫 이벤트에서 캐시 선제 갱신
+    if prev_event_time > 0 && now_ms.saturating_sub(prev_event_time) >= 5000 {
+        schedule_async_refresh();
+    }
 
     // macOS가 이벤트 탭을 비활성화했으면 재활성화 요청
     // 콜백에서 직접 재시도하지 않고, 감시 스레드가 처리하도록 플래그만 설정
@@ -1096,8 +1124,10 @@ fn handle_event(
             Some(event.clone())
         }
         CGEventType::FlagsChanged => {
-            // 수정키 변경 시 입력 소스 캐시 무효화
+            // 수정키 변경 시 입력 소스 캐시 무효화 + 비동기 사전 갱신
+            // modifier 이벤트에서 미리 캐시를 갱신해두어 후속 KeyDown에서 캐시 히트 보장
             invalidate_input_source_cache();
+            schedule_async_refresh();
 
             // Cmd 키 감지: 앱 전환(Cmd+Tab) 등에 의한 버퍼 오염 방지
             let flags = event.get_flags();

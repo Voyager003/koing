@@ -25,7 +25,7 @@ impl Default for AutoDetectorConfig {
         Self {
             threshold: 70.0,
             realtime_threshold: 80.0,
-            min_length: 2,
+            min_length: 3,
             debounce_ms: 500,
         }
     }
@@ -78,7 +78,21 @@ impl AutoDetector {
             return false;
         }
 
-        self.get_confidence(buffer) >= self.config.threshold
+        let confidence = self.get_confidence(buffer);
+
+        // 영어 패턴 필터: 매우 높은 신뢰도(90+)가 아니면 영어 패턴 감지 시 거부
+        if confidence < 90.0 && has_english_pattern(buffer) {
+            return false;
+        }
+
+        // 짧은 입력(3~4자)에 대해 threshold +10점 추가 요구 (오탐 방지)
+        let threshold = if buffer.len() <= 4 {
+            self.config.threshold + 10.0
+        } else {
+            self.config.threshold
+        };
+
+        confidence >= threshold
     }
 
     /// 변환 결과가 유효한지 검증 (낱자모 비율 체크)
@@ -114,8 +128,22 @@ impl AutoDetector {
             return false;
         }
 
+        let confidence = self.get_confidence(buffer);
+
+        // 영어 패턴 필터: 매우 높은 신뢰도(90+)가 아니면 영어 패턴 감지 시 거부
+        if confidence < 90.0 && has_english_pattern(buffer) {
+            return false;
+        }
+
+        // 짧은 입력(3~4자)에 대해 threshold +10점 추가 요구 (오탐 방지)
+        let threshold = if buffer.len() <= 4 {
+            self.config.realtime_threshold + 10.0
+        } else {
+            self.config.realtime_threshold
+        };
+
         // 높은 신뢰도 요구
-        self.get_confidence(buffer) >= self.config.realtime_threshold
+        confidence >= threshold
     }
 
     /// debounce 타이머 값 반환
@@ -141,7 +169,12 @@ impl AutoDetector {
         // 3. 자음-모음 교대 패턴 점수 (0-30점)
         let alternation_score = self.calculate_alternation_score(&chars);
 
-        cv_score + bigram_score + alternation_score
+        // 4. 연속 모음키 패널티
+        // 한글 두벌식에서 모음키 3개 이상 연속은 거의 불가능 (자음이 반드시 끼어듦)
+        // "you"(y=ㅛ,o=ㅐ,u=ㅕ) 같은 영단어의 연속 모음 패턴 감지
+        let vowel_penalty = self.calculate_consecutive_vowel_penalty(&chars);
+
+        (cv_score + bigram_score + alternation_score - vowel_penalty).max(0.0)
     }
 
     /// 자음/모음 비율 점수 계산
@@ -179,13 +212,15 @@ impl AutoDetector {
     }
 
     /// 바이그램 패턴 점수 계산
+    /// 한/영 겹침 바이그램을 별도 집계하여 "한글 전용" 바이그램 비율을 주요 지표로 사용
     fn calculate_bigram_score(&self, buffer: &str) -> f32 {
         if buffer.len() < 2 {
             return 0.0;
         }
 
-        let mut hangul_matches = 0;
-        let mut english_matches = 0;
+        let mut exclusive_hangul = 0; // 한글에만 매칭 (영어에 없음)
+        let mut exclusive_english = 0; // 영어에만 매칭 (한글에 없음)
+        let mut both_match = 0; // 한/영 모두 매칭 (겹침)
         let mut total_bigrams = 0;
 
         let chars: Vec<char> = buffer.chars().collect();
@@ -193,11 +228,14 @@ impl AutoDetector {
             let bigram: String = window.iter().collect();
             total_bigrams += 1;
 
-            if HANGUL_BIGRAMS.contains(bigram.as_str()) {
-                hangul_matches += 1;
-            }
-            if ENGLISH_BIGRAMS.contains(bigram.as_str()) {
-                english_matches += 1;
+            let is_hangul = HANGUL_BIGRAMS.contains(bigram.as_str());
+            let is_english = ENGLISH_BIGRAMS.contains(bigram.as_str());
+
+            match (is_hangul, is_english) {
+                (true, true) => both_match += 1,
+                (true, false) => exclusive_hangul += 1,
+                (false, true) => exclusive_english += 1,
+                (false, false) => {}
             }
         }
 
@@ -205,11 +243,21 @@ impl AutoDetector {
             return 0.0;
         }
 
-        let hangul_ratio = hangul_matches as f32 / total_bigrams as f32;
-        let english_ratio = english_matches as f32 / total_bigrams as f32;
+        let exclusive_hangul_ratio = exclusive_hangul as f32 / total_bigrams as f32;
+        let exclusive_english_ratio = exclusive_english as f32 / total_bigrams as f32;
+        let english_total_ratio =
+            (exclusive_english + both_match) as f32 / total_bigrams as f32;
 
-        // 한글 패턴이 많고 영어 패턴이 적을수록 높은 점수
-        let score = (hangul_ratio - english_ratio + 1.0) / 2.0 * 40.0;
+        // 영어 바이그램 비율이 50% 초과 시 한글 전용 비율만으로 점수 산정
+        // 겹침(th, an 등)이 많아도 한글 전용 바이그램이 충분하면 높은 점수
+        let score = if english_total_ratio > 0.5 {
+            exclusive_hangul_ratio * 40.0
+        } else {
+            // 한글 전용 비율에서 영어 전용 비율을 차감
+            let net_ratio = (exclusive_hangul_ratio - exclusive_english_ratio + 1.0) / 2.0;
+            net_ratio * 40.0
+        };
+
         score.clamp(0.0, 40.0)
     }
 
@@ -249,12 +297,82 @@ impl AutoDetector {
         let ratio = alternations as f32 / max_alternations as f32;
         ratio * 30.0
     }
+
+    /// 연속 모음키 패널티 계산
+    /// 한글 두벌식에서 모음키 3개 이상 연속은 거의 불가능 (자음이 반드시 끼어듦)
+    /// 3연속 모음: 10점 패널티, 4+ 연속: 20점 패널티
+    fn calculate_consecutive_vowel_penalty(&self, chars: &[char]) -> f32 {
+        let mut max_consecutive = 0;
+        let mut current_consecutive = 0;
+
+        for &c in chars {
+            if is_vowel_key(c) || is_vowel_key(c.to_ascii_uppercase()) {
+                current_consecutive += 1;
+                if current_consecutive > max_consecutive {
+                    max_consecutive = current_consecutive;
+                }
+            } else {
+                current_consecutive = 0;
+            }
+        }
+
+        if max_consecutive >= 4 {
+            20.0
+        } else if max_consecutive >= 3 {
+            10.0
+        } else {
+            0.0
+        }
+    }
 }
 
 impl Default for AutoDetector {
     fn default() -> Self {
         Self::with_defaults()
     }
+}
+
+/// 영어 패턴 감지 — 다음 패턴 중 하나라도 해당하면 자동 변환 거부
+/// - 전체 대문자 2자 이상 (약어: "OK", "PDF", "API")
+/// - CamelCase 패턴 (변수명: "onClick", "setState")
+/// - 영어 접미사 (-tion, -ment, -ness, -ing, -able, -ful, -less)
+/// - 5자 이상에서 영어 접두사 (un-, re-, pre-, dis-, mis-)
+fn has_english_pattern(buffer: &str) -> bool {
+    // 전체 대문자 2자 이상 (약어)
+    if buffer.len() >= 2 && buffer.chars().all(|c| c.is_ascii_uppercase()) {
+        return true;
+    }
+
+    // CamelCase: 소문자 시작 후 대문자 포함 (예: onClick, setState)
+    let chars: Vec<char> = buffer.chars().collect();
+    if chars.len() >= 3 {
+        let starts_lower = chars[0].is_ascii_lowercase();
+        let has_upper = chars[1..].iter().any(|c| c.is_ascii_uppercase());
+        if starts_lower && has_upper {
+            return true;
+        }
+    }
+
+    // 영어 접미사
+    let lower = buffer.to_lowercase();
+    let suffixes = ["tion", "ment", "ness", "ing", "able", "ful", "less", "ous", "ive", "ence", "ance"];
+    for suffix in &suffixes {
+        if lower.len() > suffix.len() && lower.ends_with(suffix) {
+            return true;
+        }
+    }
+
+    // 5자 이상에서 영어 접두사
+    if lower.len() >= 5 {
+        let prefixes = ["un", "re", "pre", "dis", "mis"];
+        for prefix in &prefixes {
+            if lower.starts_with(prefix) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -265,6 +383,7 @@ mod tests {
     fn test_should_convert_short_buffer() {
         let detector = AutoDetector::with_defaults();
         assert!(!detector.should_convert("r")); // 1글자는 너무 짧음
+        assert!(!detector.should_convert("rk")); // 2글자도 최소 길이 미달
     }
 
     #[test]
@@ -350,8 +469,9 @@ mod tests {
     fn test_realtime_short_buffer() {
         let detector = AutoDetector::with_defaults();
 
-        // 1글자 버퍼는 변환되지 않음
+        // 1~2글자 버퍼는 변환되지 않음
         assert!(!detector.should_convert_realtime("r")); // 1글자
+        assert!(!detector.should_convert_realtime("rk")); // 2글자
     }
 
     #[test]
@@ -392,5 +512,75 @@ mod tests {
 
         // 빈 문자열
         assert!(!detector.is_valid_conversion(""));
+    }
+
+    #[test]
+    fn test_has_english_pattern_abbreviations() {
+        // 전체 대문자 약어
+        assert!(has_english_pattern("OK"));
+        assert!(has_english_pattern("PDF"));
+        assert!(has_english_pattern("API"));
+        assert!(has_english_pattern("HTTP"));
+    }
+
+    #[test]
+    fn test_has_english_pattern_camelcase() {
+        // CamelCase 변수명
+        assert!(has_english_pattern("onClick"));
+        assert!(has_english_pattern("setState"));
+        assert!(has_english_pattern("isValid"));
+    }
+
+    #[test]
+    fn test_has_english_pattern_suffixes() {
+        // 영어 접미사
+        assert!(has_english_pattern("function")); // -tion
+        assert!(has_english_pattern("movement")); // -ment
+        assert!(has_english_pattern("running")); // -ing
+        assert!(has_english_pattern("readable")); // -able
+    }
+
+    #[test]
+    fn test_has_english_pattern_prefixes() {
+        // 5자 이상 영어 접두사
+        assert!(has_english_pattern("unable")); // un-
+        assert!(has_english_pattern("return")); // re- (6자)
+        assert!(has_english_pattern("prevent")); // pre-
+        assert!(has_english_pattern("disable")); // dis-
+    }
+
+    #[test]
+    fn test_has_english_pattern_not_korean() {
+        // 한글 패턴은 영어 패턴으로 감지되지 않아야 함
+        assert!(!has_english_pattern("dkssud")); // 안녕
+        assert!(!has_english_pattern("gksrmf")); // 한글
+        assert!(!has_english_pattern("rkskek")); // 가나다
+    }
+
+    #[test]
+    fn test_consecutive_vowel_penalty() {
+        let detector = AutoDetector::with_defaults();
+
+        // "you" → y(ㅛ), o(ㅐ), u(ㅕ) — 3연속 모음키
+        let confidence_you = detector.get_confidence("you");
+        // "rks" → r(ㄱ), k(ㅏ), s(ㄴ) — 자음+모음+자음 (패널티 없음)
+        let confidence_rks = detector.get_confidence("rks");
+        // "you"는 연속 모음 패널티로 낮아야 함
+        assert!(
+            confidence_you < confidence_rks,
+            "연속 모음 패널티: you({}) < rks({})",
+            confidence_you,
+            confidence_rks
+        );
+    }
+
+    #[test]
+    fn test_english_pattern_filter_in_should_convert() {
+        let detector = AutoDetector::with_defaults();
+
+        // 영어 패턴 필터로 차단되어야 하는 입력들
+        assert!(!detector.should_convert("onClick")); // CamelCase
+        assert!(!detector.should_convert("running")); // -ing 접미사
+        assert!(!detector.should_convert("disable")); // dis- 접두사
     }
 }
