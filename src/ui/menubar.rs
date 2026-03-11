@@ -46,9 +46,8 @@ static SWITCH_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
 static SLOW_DEBOUNCE_MENU_ITEMS: Mutex<[SendId; 4]> = Mutex::new([SendId::NULL; 4]);
 
 use super::{
-    DEBOUNCE_LABELS, DEBOUNCE_PRESETS,
-    SLOW_DEBOUNCE_LABELS, SLOW_DEBOUNCE_PRESETS,
-    SWITCH_LABELS, SWITCH_PRESETS,
+    DEBOUNCE_LABELS, DEBOUNCE_PRESETS, SLOW_DEBOUNCE_LABELS, SLOW_DEBOUNCE_PRESETS, SWITCH_LABELS,
+    SWITCH_PRESETS,
 };
 
 /// 현재 설정 읽어서 KoingConfig 구성
@@ -72,13 +71,17 @@ fn update_checkmarks(menu_items: &Mutex<[SendId; 4]>, presets: &[u64; 4], select
         let item = items[i].0;
         if !item.is_null() {
             let s: cocoa::foundation::NSInteger = if preset == selected { 1 } else { 0 };
-            unsafe { let _: () = msg_send![item, setState: s]; }
+            unsafe {
+                let _: () = msg_send![item, setState: s];
+            }
         }
     }
 }
 
 fn set_debounce(ms: u64) {
-    let Some(state) = EVENT_STATE.get() else { return };
+    let Some(state) = EVENT_STATE.get() else {
+        return;
+    };
     state.set_debounce_ms(ms);
     update_checkmarks(&DEBOUNCE_MENU_ITEMS, &DEBOUNCE_PRESETS, ms);
 
@@ -89,7 +92,9 @@ fn set_debounce(ms: u64) {
 }
 
 fn set_switch(ms: u64) {
-    let Some(state) = EVENT_STATE.get() else { return };
+    let Some(state) = EVENT_STATE.get() else {
+        return;
+    };
     state.set_switch_delay_ms(ms);
     update_checkmarks(&SWITCH_MENU_ITEMS, &SWITCH_PRESETS, ms);
 
@@ -100,7 +105,9 @@ fn set_switch(ms: u64) {
 }
 
 fn set_slow_debounce(ms: u64) {
-    let Some(state) = EVENT_STATE.get() else { return };
+    let Some(state) = EVENT_STATE.get() else {
+        return;
+    };
     state.set_slow_debounce_ms(ms);
     update_checkmarks(&SLOW_DEBOUNCE_MENU_ITEMS, &SLOW_DEBOUNCE_PRESETS, ms);
 
@@ -124,23 +131,49 @@ extern "C" fn quit_action(_this: &Object, _cmd: Sel, _sender: id) {
     }
 }
 
-extern "C" fn set_debounce_200(_: &Object, _: Sel, _: id) { set_debounce(200); }
-extern "C" fn set_debounce_300(_: &Object, _: Sel, _: id) { set_debounce(300); }
-extern "C" fn set_debounce_500(_: &Object, _: Sel, _: id) { set_debounce(500); }
-extern "C" fn set_debounce_800(_: &Object, _: Sel, _: id) { set_debounce(800); }
+extern "C" fn set_debounce_200(_: &Object, _: Sel, _: id) {
+    set_debounce(200);
+}
+extern "C" fn set_debounce_300(_: &Object, _: Sel, _: id) {
+    set_debounce(300);
+}
+extern "C" fn set_debounce_500(_: &Object, _: Sel, _: id) {
+    set_debounce(500);
+}
+extern "C" fn set_debounce_800(_: &Object, _: Sel, _: id) {
+    set_debounce(800);
+}
 
-extern "C" fn set_switch_0(_: &Object, _: Sel, _: id)    { set_switch(0); }
-extern "C" fn set_switch_10(_: &Object, _: Sel, _: id)   { set_switch(10); }
-extern "C" fn set_switch_30(_: &Object, _: Sel, _: id)   { set_switch(30); }
-extern "C" fn set_switch_50(_: &Object, _: Sel, _: id)   { set_switch(50); }
+extern "C" fn set_switch_0(_: &Object, _: Sel, _: id) {
+    set_switch(0);
+}
+extern "C" fn set_switch_10(_: &Object, _: Sel, _: id) {
+    set_switch(10);
+}
+extern "C" fn set_switch_30(_: &Object, _: Sel, _: id) {
+    set_switch(30);
+}
+extern "C" fn set_switch_50(_: &Object, _: Sel, _: id) {
+    set_switch(50);
+}
 
-extern "C" fn set_slow_debounce_1000(_: &Object, _: Sel, _: id) { set_slow_debounce(1000); }
-extern "C" fn set_slow_debounce_1500(_: &Object, _: Sel, _: id) { set_slow_debounce(1500); }
-extern "C" fn set_slow_debounce_2000(_: &Object, _: Sel, _: id) { set_slow_debounce(2000); }
-extern "C" fn set_slow_debounce_3000(_: &Object, _: Sel, _: id) { set_slow_debounce(3000); }
+extern "C" fn set_slow_debounce_1000(_: &Object, _: Sel, _: id) {
+    set_slow_debounce(1000);
+}
+extern "C" fn set_slow_debounce_1500(_: &Object, _: Sel, _: id) {
+    set_slow_debounce(1500);
+}
+extern "C" fn set_slow_debounce_2000(_: &Object, _: Sel, _: id) {
+    set_slow_debounce(2000);
+}
+extern "C" fn set_slow_debounce_3000(_: &Object, _: Sel, _: id) {
+    set_slow_debounce(3000);
+}
 
 extern "C" fn toggle_enabled(_: &Object, _: Sel, _: id) {
-    let Some(state) = EVENT_STATE.get() else { return };
+    let Some(state) = EVENT_STATE.get() else {
+        return;
+    };
     let new_enabled = !state.is_enabled();
     state.set_enabled(new_enabled);
 
@@ -148,7 +181,9 @@ extern "C" fn toggle_enabled(_: &Object, _: Sel, _: id) {
     let toggle_item = TOGGLE_MENU_ITEM.lock().unwrap_or_else(|e| e.into_inner());
     if !toggle_item.0.is_null() {
         let check: cocoa::foundation::NSInteger = if new_enabled { 1 } else { 0 };
-        unsafe { let _: () = msg_send![toggle_item.0, setState: check]; }
+        unsafe {
+            let _: () = msg_send![toggle_item.0, setState: check];
+        }
     }
 
     // 메뉴바 아이콘 알파값 변경 (비활성화 시 흐리게)
@@ -179,7 +214,9 @@ pub fn update_toggle_state(enabled: bool) {
     let toggle_item = TOGGLE_MENU_ITEM.lock().unwrap_or_else(|e| e.into_inner());
     if !toggle_item.0.is_null() {
         let check: cocoa::foundation::NSInteger = if enabled { 1 } else { 0 };
-        unsafe { let _: () = msg_send![toggle_item.0, setState: check]; }
+        unsafe {
+            let _: () = msg_send![toggle_item.0, setState: check];
+        }
     }
 
     let status_item = STATUS_ITEM.lock().unwrap_or_else(|e| e.into_inner());
@@ -210,10 +247,22 @@ fn create_app_delegate_class() -> &'static Class {
         decl.add_method(sel!(setSwitch10:), set_switch_10 as ActionFn);
         decl.add_method(sel!(setSwitch30:), set_switch_30 as ActionFn);
         decl.add_method(sel!(setSwitch50:), set_switch_50 as ActionFn);
-        decl.add_method(sel!(setSlowDebounce1000:), set_slow_debounce_1000 as ActionFn);
-        decl.add_method(sel!(setSlowDebounce1500:), set_slow_debounce_1500 as ActionFn);
-        decl.add_method(sel!(setSlowDebounce2000:), set_slow_debounce_2000 as ActionFn);
-        decl.add_method(sel!(setSlowDebounce3000:), set_slow_debounce_3000 as ActionFn);
+        decl.add_method(
+            sel!(setSlowDebounce1000:),
+            set_slow_debounce_1000 as ActionFn,
+        );
+        decl.add_method(
+            sel!(setSlowDebounce1500:),
+            set_slow_debounce_1500 as ActionFn,
+        );
+        decl.add_method(
+            sel!(setSlowDebounce2000:),
+            set_slow_debounce_2000 as ActionFn,
+        );
+        decl.add_method(
+            sel!(setSlowDebounce3000:),
+            set_slow_debounce_3000 as ActionFn,
+        );
         decl.add_method(sel!(toggleEnabled:), toggle_enabled as ActionFn);
         decl.add_method(sel!(openSettings:), open_settings as ActionFn);
     }
@@ -475,4 +524,3 @@ impl Drop for MenuBarApp {
         }
     }
 }
-

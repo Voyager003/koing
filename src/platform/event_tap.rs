@@ -1,7 +1,10 @@
 //! CGEventTap을 사용한 키보드 이벤트 감지
 
 use crate::detection::AutoDetector;
-use crate::platform::input_source::{invalidate_input_source_cache, is_english_input_source, schedule_async_refresh, switch_to_korean_on_main};
+use crate::platform::input_source::{
+    cached_input_source_snapshot, invalidate_input_source_cache, schedule_async_refresh,
+    switch_to_korean_on_main, InputSourceState,
+};
 use crate::platform::text_replacer::KOING_SYNTHETIC_EVENT_MARKER;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
@@ -212,6 +215,7 @@ impl Default for HotkeyConfig {
 /// 이벤트 탭 핸들러에서 사용할 공유 상태
 pub struct EventTapState {
     pub buffer: Mutex<KeyBuffer>,
+    pending_buffer: Mutex<KeyBuffer>,
     pub hotkey: HotkeyConfig,
     pub running: AtomicBool,
     /// Koing 활성화 여부 (false이면 모든 이벤트를 그대로 통과)
@@ -256,6 +260,7 @@ impl EventTapState {
     pub fn new(hotkey: HotkeyConfig) -> Self {
         Self {
             buffer: Mutex::new(KeyBuffer::new(100)),
+            pending_buffer: Mutex::new(KeyBuffer::new(100)),
             hotkey,
             running: AtomicBool::new(true),
             enabled: AtomicBool::new(true),
@@ -484,6 +489,7 @@ impl EventTapState {
     /// 합성 이벤트가 의도하지 않은 윈도우에 전송되는 것을 방지
     pub fn cancel_pending_conversion(&self) {
         lock_or_recover(&self.buffer).clear();
+        lock_or_recover(&self.pending_buffer).clear();
         self.send_debounce_command(DebounceCommand::Cancel);
         self.send_switch_command(SwitchCommand::Cancel);
     }
@@ -495,7 +501,48 @@ impl EventTapState {
         self.send_switch_command(SwitchCommand::Shutdown);
         let rl = self.run_loop.load(Ordering::Acquire);
         if !rl.is_null() {
-            unsafe { CFRunLoopStop(rl); }
+            unsafe {
+                CFRunLoopStop(rl);
+            }
+        }
+    }
+
+    fn push_pending_char(&self, c: char) {
+        lock_or_recover(&self.pending_buffer).push(c);
+    }
+
+    fn pop_pending_char(&self) -> Option<char> {
+        lock_or_recover(&self.pending_buffer).pop()
+    }
+
+    fn has_pending_buffer(&self) -> bool {
+        !lock_or_recover(&self.pending_buffer).is_empty()
+    }
+
+    fn resolve_pending_buffer(&self, input_source: InputSourceState) {
+        match input_source {
+            InputSourceState::English => {
+                let pending = {
+                    let mut pending = lock_or_recover(&self.pending_buffer);
+                    let staged = pending.get().to_string();
+                    pending.clear();
+                    staged
+                };
+                if pending.is_empty() {
+                    return;
+                }
+
+                let mut buffer = lock_or_recover(&self.buffer);
+                for c in pending.chars() {
+                    buffer.push(c);
+                }
+            }
+            InputSourceState::NonEnglish | InputSourceState::Unknown => {
+                lock_or_recover(&self.pending_buffer).clear();
+                if input_source == InputSourceState::NonEnglish {
+                    lock_or_recover(&self.buffer).clear();
+                }
+            }
         }
     }
 }
@@ -555,9 +602,7 @@ fn start_debounce_timer(state: Arc<EventTapState>) {
                             state_for_timer.slow_debounce_ms.load(Ordering::Relaxed),
                         )
                     } else {
-                        Duration::from_millis(
-                            state_for_timer.debounce_ms.load(Ordering::Relaxed),
-                        )
+                        Duration::from_millis(state_for_timer.debounce_ms.load(Ordering::Relaxed))
                     };
 
                     if elapsed >= target_duration {
@@ -570,10 +615,11 @@ fn start_debounce_timer(state: Arc<EventTapState>) {
                     Duration::from_secs(3600)
                 };
 
-                let (new_guard, timeout_result) = cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
-                    let g = e.into_inner();
-                    (g.0, g.1)
-                });
+                let (new_guard, timeout_result) =
+                    cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
+                        let g = e.into_inner();
+                        (g.0, g.1)
+                    });
                 guard = new_guard;
 
                 if timeout_result.timed_out() && deadline.is_some() {
@@ -594,7 +640,7 @@ fn start_debounce_timer(state: Arc<EventTapState>) {
                     fast_triggered = false;
                 } else {
                     fast_triggered = true; // 1단계 실패, 2단계 대기
-                    // deadline을 현재 시점으로 갱신 — slow_debounce_ms만큼 추가 대기
+                                           // deadline을 현재 시점으로 갱신 — slow_debounce_ms만큼 추가 대기
                     deadline = Some(Instant::now());
                 }
             } else {
@@ -652,10 +698,11 @@ fn start_switch_timer(state: Arc<EventTapState>) {
                     Duration::from_secs(3600)
                 };
 
-                let (new_guard, timeout_result) = cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
-                    let g = e.into_inner();
-                    (g.0, g.1)
-                });
+                let (new_guard, timeout_result) =
+                    cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
+                        let g = e.into_inner();
+                        (g.0, g.1)
+                    });
                 guard = new_guard;
 
                 if timeout_result.timed_out() && deadline.is_some() {
@@ -760,12 +807,6 @@ fn trigger_slow_conversion(state: &EventTapState) -> bool {
 
         // 한 글자 변환은 오탐 방지
         if converted.chars().count() <= 1 {
-            return false;
-        }
-
-        // 최소한의 confidence 확인 (threshold 70)
-        let detector = lock_or_recover(&state.auto_detector);
-        if !detector.should_convert(&content) {
             return false;
         }
 
@@ -1004,12 +1045,16 @@ fn handle_event(
             if keycode == 51 {
                 // 비문자 키에서도 conversion_just_triggered 리셋
                 // (Space/Enter만 swap으로 이전 값을 확인하므로 여기서는 단순 store)
-                state.conversion_just_triggered.store(false, Ordering::Release);
-                let mut buffer = lock_or_recover(&state.buffer);
-                buffer.pop();
-                if buffer.is_empty() {
+                state
+                    .conversion_just_triggered
+                    .store(false, Ordering::Release);
+                if state.pop_pending_char().is_none() {
+                    let mut buffer = lock_or_recover(&state.buffer);
+                    buffer.pop();
+                }
+                if !state.has_pending_buffer() && lock_or_recover(&state.buffer).is_empty() {
                     state.send_debounce_command(DebounceCommand::Cancel);
-                } else if state.is_realtime_mode() {
+                } else if state.is_realtime_mode() && !state.has_pending_buffer() {
                     state.send_debounce_command(DebounceCommand::Reset);
                 }
                 return Some(event.clone());
@@ -1018,8 +1063,11 @@ fn handle_event(
             // 버퍼 초기화 조건: Tab, Escape, 방향키
             if matches!(keycode, 48 | 53 | 123..=126) {
                 // 비문자 키에서도 conversion_just_triggered 리셋
-                state.conversion_just_triggered.store(false, Ordering::Release);
+                state
+                    .conversion_just_triggered
+                    .store(false, Ordering::Release);
                 lock_or_recover(&state.buffer).clear();
+                lock_or_recover(&state.pending_buffer).clear();
                 state.send_debounce_command(DebounceCommand::Cancel);
                 state.send_switch_command(SwitchCommand::Cancel);
                 return Some(event.clone());
@@ -1027,6 +1075,14 @@ fn handle_event(
 
             // Space 입력 시: 버퍼 초기화 (변환 트리거 없이 통과)
             if keycode == 49 {
+                let snapshot = cached_input_source_snapshot();
+                if state.has_pending_buffer() {
+                    if snapshot.is_fresh {
+                        state.resolve_pending_buffer(snapshot.state);
+                    } else {
+                        lock_or_recover(&state.pending_buffer).clear();
+                    }
+                }
                 state.send_debounce_command(DebounceCommand::Cancel);
                 // debounce가 직전에 버퍼를 소비했다면 Space 소비
                 if state
@@ -1042,6 +1098,14 @@ fn handle_event(
 
             // Enter 입력 시 버퍼 초기화 (자동 변환 비활성화)
             if keycode == 36 {
+                let snapshot = cached_input_source_snapshot();
+                if state.has_pending_buffer() {
+                    if snapshot.is_fresh {
+                        state.resolve_pending_buffer(snapshot.state);
+                    } else {
+                        lock_or_recover(&state.pending_buffer).clear();
+                    }
+                }
                 state.send_debounce_command(DebounceCommand::Cancel);
 
                 // debounce가 직전에 버퍼를 소비했다면 Enter 소비
@@ -1059,14 +1123,27 @@ fn handle_event(
 
             // 문자 키 처리 - 영문 입력 모드일 때만 버퍼링
             if let Some(c) = keycode_to_char(keycode, shift_pressed) {
+                let snapshot = cached_input_source_snapshot();
+                if snapshot.is_fresh {
+                    state.resolve_pending_buffer(snapshot.state);
+                }
+
+                if !snapshot.is_fresh || snapshot.state == InputSourceState::Unknown {
+                    state.push_pending_char(c);
+                    state.send_debounce_command(DebounceCommand::Cancel);
+                    state.send_switch_command(SwitchCommand::Cancel);
+                    log::debug!("입력 소스 refresh 대기 중, pending 버퍼에 문자 보관: {}", c);
+                    return Some(event.clone());
+                }
+
                 // 현재 입력 소스 확인 (TIS API)
                 // 한글 IME 영문 서브모드(A 모드)도 is_english_input_source()에서 감지됨
                 // 주의: CGEvent 유니코드(event_produces_latin_char)는 HID 레벨에서
                 //       IME 처리 전 raw 문자를 반환하므로 한글 모드에서도 true가 될 수 있음
-                let is_english = is_english_input_source();
-                if !is_english {
+                if snapshot.state != InputSourceState::English {
                     // 한글 입력 모드: 버퍼 클리어하고 패스스루
                     lock_or_recover(&state.buffer).clear();
+                    lock_or_recover(&state.pending_buffer).clear();
                     state.send_debounce_command(DebounceCommand::Cancel);
                     state.send_switch_command(SwitchCommand::Cancel);
                     return Some(event.clone());
@@ -1119,7 +1196,8 @@ fn handle_event(
                                 state
                                     .conversion_just_triggered
                                     .store(true, Ordering::Release);
-                                if let Some(callback) = lock_or_recover(&state.on_convert).as_ref() {
+                                if let Some(callback) = lock_or_recover(&state.on_convert).as_ref()
+                                {
                                     callback(buffer_before, false); // 실시간 즉시
                                 }
                             }
@@ -1140,6 +1218,7 @@ fn handle_event(
             let flags = event.get_flags();
             if flags.contains(CGEventFlags::CGEventFlagCommand) {
                 lock_or_recover(&state.buffer).clear();
+                lock_or_recover(&state.pending_buffer).clear();
                 state.send_debounce_command(DebounceCommand::Cancel);
                 state.send_switch_command(SwitchCommand::Cancel);
             }
@@ -1189,5 +1268,31 @@ mod tests {
         let config = HotkeyConfig::default();
         assert!(config.require_option);
         assert_eq!(config.trigger_keycode, 49);
+    }
+
+    #[test]
+    fn test_pending_buffer_moves_to_active_buffer_when_english_is_confirmed() {
+        let state = EventTapState::new(HotkeyConfig::default());
+        state.push_pending_char('d');
+        state.push_pending_char('k');
+
+        state.resolve_pending_buffer(crate::platform::input_source::InputSourceState::English);
+
+        let buffer = lock_or_recover(&state.buffer);
+        assert_eq!(buffer.get(), "dk");
+    }
+
+    #[test]
+    fn test_pending_buffer_is_cleared_when_non_english_is_confirmed() {
+        let state = EventTapState::new(HotkeyConfig::default());
+        state.push_pending_char('d');
+        state.push_pending_char('k');
+
+        state.resolve_pending_buffer(crate::platform::input_source::InputSourceState::NonEnglish);
+
+        let buffer = lock_or_recover(&state.buffer);
+        assert!(buffer.is_empty());
+        let pending = lock_or_recover(&state.pending_buffer);
+        assert!(pending.is_empty());
     }
 }

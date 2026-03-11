@@ -19,6 +19,9 @@ pub struct KoingConfig {
     /// 느린 변환 대기 시간 (ms) — N-gram 점수가 낮지만 유효한 한글용
     #[serde(default = "default_slow_debounce_ms")]
     pub slow_debounce_ms: u64,
+    /// 자동 변환에서 제외할 영문 단어 목록
+    #[serde(default)]
+    pub never_convert_words: Vec<String>,
 }
 
 fn default_enabled() -> bool {
@@ -44,6 +47,7 @@ impl Default for KoingConfig {
             debounce_ms: default_debounce_ms(),
             switch_delay_ms: default_switch_delay_ms(),
             slow_debounce_ms: default_slow_debounce_ms(),
+            never_convert_words: Vec::new(),
         }
     }
 }
@@ -68,9 +72,7 @@ pub fn config_path() -> PathBuf {
 pub fn load_config() -> KoingConfig {
     let path = config_path();
     match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
-            KoingConfig::default()
-        }),
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| KoingConfig::default()),
         Err(_) => KoingConfig::default(),
     }
 }
@@ -104,11 +106,13 @@ mod tests {
             debounce_ms: 150,
             switch_delay_ms: 50,
             slow_debounce_ms: 1500,
+            never_convert_words: vec!["slack".to_string()],
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: KoingConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.debounce_ms, 150);
         assert_eq!(parsed.switch_delay_ms, 50);
+        assert_eq!(parsed.never_convert_words, vec!["slack".to_string()]);
     }
 
     #[test]
@@ -118,5 +122,6 @@ mod tests {
         let config: KoingConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.debounce_ms, 300);
         assert_eq!(config.switch_delay_ms, 300);
+        assert!(config.never_convert_words.is_empty());
     }
 }

@@ -52,6 +52,19 @@ pub struct NgramModel {
     total_unigrams: u64,
 }
 
+/// 텍스트에 대한 N-gram 분석 결과
+#[derive(Debug, Clone, PartialEq)]
+pub struct NgramAnalysis {
+    /// 평균 로그 확률 점수
+    pub score: f64,
+    /// 미등록 유니그램 비율 (0.0 ~ 1.0)
+    pub unknown_unigram_ratio: f64,
+    /// 미등록 바이그램 비율 (0.0 ~ 1.0)
+    pub unknown_bigram_ratio: f64,
+    /// 등록된 바이그램 개수
+    pub seen_bigram_count: usize,
+}
+
 impl NgramModel {
     /// JSON 파일에서 N-gram 모델 로드
     ///
@@ -67,16 +80,16 @@ impl NgramModel {
         let reader = BufReader::new(file);
 
         // serde_json으로 파싱
-        let value: serde_json::Value = serde_json::from_reader(reader)
-            .map_err(|e| NgramError::ParseError(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_reader(reader).map_err(|e| NgramError::ParseError(e.to_string()))?;
 
         Self::from_json_value(&value)
     }
 
     /// JSON 문자열에서 모델 로드
     pub fn from_json(json_str: &str) -> Result<Self, NgramError> {
-        let value: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| NgramError::ParseError(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| NgramError::ParseError(e.to_string()))?;
 
         Self::from_json_value(&value)
     }
@@ -93,12 +106,13 @@ impl NgramModel {
         let mut total_unigrams = 0u64;
 
         for (key, val) in unigrams_obj {
-            let char = key.chars().next().ok_or_else(|| {
-                NgramError::FormatError(format!("빈 유니그램 키: {}", key))
-            })?;
-            let count = val.as_u64().ok_or_else(|| {
-                NgramError::FormatError(format!("유효하지 않은 빈도값: {}", key))
-            })?;
+            let char = key
+                .chars()
+                .next()
+                .ok_or_else(|| NgramError::FormatError(format!("빈 유니그램 키: {}", key)))?;
+            let count = val
+                .as_u64()
+                .ok_or_else(|| NgramError::FormatError(format!("유효하지 않은 빈도값: {}", key)))?;
             unigrams.insert(char, count);
             total_unigrams += count;
         }
@@ -128,9 +142,9 @@ impl NgramModel {
                 NgramError::FormatError(format!("빈 바이그램 두 번째 문자: {}", key))
             })?;
 
-            let count = val.as_u64().ok_or_else(|| {
-                NgramError::FormatError(format!("유효하지 않은 빈도값: {}", key))
-            })?;
+            let count = val
+                .as_u64()
+                .ok_or_else(|| NgramError::FormatError(format!("유효하지 않은 빈도값: {}", key)))?;
 
             bigrams.insert((first, second), count);
         }
@@ -179,18 +193,45 @@ impl NgramModel {
 
     /// 설정을 적용한 스코어 계산
     pub fn score_with_config(&self, text: &str, config: &NgramConfig) -> f64 {
+        self.analyze_with_config(text, config).score
+    }
+
+    /// 설정을 적용한 상세 분석 결과 계산
+    pub fn analyze_with_config(&self, text: &str, config: &NgramConfig) -> NgramAnalysis {
         let chars: Vec<char> = text.chars().collect();
+        let total_unigrams = chars.len();
+        let unknown_unigrams = chars
+            .iter()
+            .filter(|&&ch| self.unigram_count(ch) == 0)
+            .count();
+        let unknown_unigram_ratio = if total_unigrams == 0 {
+            0.0
+        } else {
+            unknown_unigrams as f64 / total_unigrams as f64
+        };
 
         if chars.len() < 2 {
             // 1글자 이하면 유니그램 확률만 사용
             if chars.is_empty() {
-                return f64::NEG_INFINITY;
+                return NgramAnalysis {
+                    score: f64::NEG_INFINITY,
+                    unknown_unigram_ratio,
+                    unknown_bigram_ratio: 0.0,
+                    seen_bigram_count: 0,
+                };
             }
-            return self.unigram_log_prob(chars[0], config);
+            return NgramAnalysis {
+                score: self.unigram_log_prob(chars[0], config),
+                unknown_unigram_ratio,
+                unknown_bigram_ratio: 0.0,
+                seen_bigram_count: 0,
+            };
         }
 
         let mut log_prob_sum = 0.0;
         let mut count = 0;
+        let mut unknown_bigrams = 0usize;
+        let mut seen_bigrams = 0usize;
 
         for window in chars.windows(2) {
             let first = window[0];
@@ -198,6 +239,11 @@ impl NgramModel {
 
             let bigram_count = self.bigram_count(first, second) as f64;
             let context_count = self.unigram_count(first) as f64;
+            if bigram_count > 0.0 {
+                seen_bigrams += 1;
+            } else {
+                unknown_bigrams += 1;
+            }
 
             // Add-k 스무딩
             let k = config.smoothing_k;
@@ -208,10 +254,22 @@ impl NgramModel {
             count += 1;
         }
 
-        if count == 0 {
+        let score = if count == 0 {
             f64::NEG_INFINITY
         } else {
             log_prob_sum / count as f64
+        };
+        let unknown_bigram_ratio = if count == 0 {
+            0.0
+        } else {
+            unknown_bigrams as f64 / count as f64
+        };
+
+        NgramAnalysis {
+            score,
+            unknown_unigram_ratio,
+            unknown_bigram_ratio,
+            seen_bigram_count: seen_bigrams,
         }
     }
 

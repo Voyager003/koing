@@ -27,7 +27,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --lib
+        run: cargo test
 
       - name: Build .app bundle
         run: |
@@ -61,3 +61,12 @@ jobs:
             ${{ steps.version.outputs.sha256 }}
             ```
           files: Koing-${{ steps.version.outputs.version }}.zip
+
+      - name: Update Homebrew Tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.version.outputs.sha256 }}
+        run: |
+          chmod +x scripts/update_homebrew_tap.sh
+          scripts/update_homebrew_tap.sh

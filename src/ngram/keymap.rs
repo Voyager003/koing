@@ -68,15 +68,15 @@ fn jungseong_to_eng(jung: u32, result: &mut String) {
     // 중성 인덱스: ㅏ(0) ㅐ(1) ㅑ(2) ㅒ(3) ㅓ(4) ㅔ(5) ㅕ(6) ㅖ(7) ㅗ(8) ㅘ(9)
     //            ㅙ(10) ㅚ(11) ㅛ(12) ㅜ(13) ㅝ(14) ㅞ(15) ㅟ(16) ㅠ(17) ㅡ(18) ㅢ(19) ㅣ(20)
     match jung {
-        0 => result.push('k'),  // ㅏ
-        1 => result.push('o'),  // ㅐ
-        2 => result.push('i'),  // ㅑ
-        3 => result.push('O'),  // ㅒ
-        4 => result.push('j'),  // ㅓ
-        5 => result.push('p'),  // ㅔ
-        6 => result.push('u'),  // ㅕ
-        7 => result.push('P'),  // ㅖ
-        8 => result.push('h'),  // ㅗ
+        0 => result.push('k'), // ㅏ
+        1 => result.push('o'), // ㅐ
+        2 => result.push('i'), // ㅑ
+        3 => result.push('O'), // ㅒ
+        4 => result.push('j'), // ㅓ
+        5 => result.push('p'), // ㅔ
+        6 => result.push('u'), // ㅕ
+        7 => result.push('P'), // ㅖ
+        8 => result.push('h'), // ㅗ
         9 => {
             // ㅘ = ㅗ + ㅏ
             result.push('h');
@@ -127,15 +127,15 @@ fn jongseong_to_eng(jong: u32, result: &mut String) {
     //            ㄻ(10) ㄼ(11) ㄽ(12) ㄾ(13) ㄿ(14) ㅀ(15) ㅁ(16) ㅂ(17) ㅄ(18) ㅅ(19)
     //            ㅆ(20) ㅇ(21) ㅈ(22) ㅊ(23) ㅋ(24) ㅌ(25) ㅍ(26) ㅎ(27)
     match jong {
-        0 => {} // 종성 없음
-        1 => result.push('r'),  // ㄱ
+        0 => {}                // 종성 없음
+        1 => result.push('r'), // ㄱ
         2 => result.push('R'), // ㄲ (Shift+R 한 번)
         3 => {
             // ㄳ = ㄱ + ㅅ
             result.push('r');
             result.push('t');
         }
-        4 => result.push('s'),  // ㄴ
+        4 => result.push('s'), // ㄴ
         5 => {
             // ㄵ = ㄴ + ㅈ
             result.push('s');
@@ -146,8 +146,8 @@ fn jongseong_to_eng(jong: u32, result: &mut String) {
             result.push('s');
             result.push('g');
         }
-        7 => result.push('e'),  // ㄷ
-        8 => result.push('f'),  // ㄹ
+        7 => result.push('e'), // ㄷ
+        8 => result.push('f'), // ㄹ
         9 => {
             // ㄺ = ㄹ + ㄱ
             result.push('f');
@@ -231,24 +231,24 @@ mod tests {
 
     #[test]
     fn test_complex_vowels() {
-        assert_eq!(korean_to_eng("완"), "dhks");  // ㅘ = ㅗ + ㅏ
-        assert_eq!(korean_to_eng("웬"), "dnps");  // ㅞ = ㅜ + ㅔ
-        assert_eq!(korean_to_eng("의"), "dml");   // ㅇ + ㅢ = d + m + l
-        assert_eq!(korean_to_eng("원"), "dnjs");  // ㅝ = ㅜ + ㅓ
+        assert_eq!(korean_to_eng("완"), "dhks"); // ㅘ = ㅗ + ㅏ
+        assert_eq!(korean_to_eng("웬"), "dnps"); // ㅞ = ㅜ + ㅔ
+        assert_eq!(korean_to_eng("의"), "dml"); // ㅇ + ㅢ = d + m + l
+        assert_eq!(korean_to_eng("원"), "dnjs"); // ㅝ = ㅜ + ㅓ
     }
 
     #[test]
     fn test_complex_jongseong() {
-        assert_eq!(korean_to_eng("읽"), "dlfr");  // ㄺ = ㄹ + ㄱ
-        assert_eq!(korean_to_eng("없"), "djqt");  // ㅄ = ㅂ + ㅅ
-        assert_eq!(korean_to_eng("삶"), "tkfa");  // ㄻ = ㄹ + ㅁ
+        assert_eq!(korean_to_eng("읽"), "dlfr"); // ㄺ = ㄹ + ㄱ
+        assert_eq!(korean_to_eng("없"), "djqt"); // ㅄ = ㅂ + ㅅ
+        assert_eq!(korean_to_eng("삶"), "tkfa"); // ㄻ = ㄹ + ㅁ
     }
 
     #[test]
     fn test_ssang_consonants() {
-        assert_eq!(korean_to_eng("까"), "Rk");   // ㄲ
-        assert_eq!(korean_to_eng("싸"), "Tk");   // ㅆ
-        assert_eq!(korean_to_eng("빠"), "Qk");   // ㅃ
+        assert_eq!(korean_to_eng("까"), "Rk"); // ㄲ
+        assert_eq!(korean_to_eng("싸"), "Tk"); // ㅆ
+        assert_eq!(korean_to_eng("빠"), "Qk"); // ㅃ
     }
 
     #[test]

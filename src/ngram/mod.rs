@@ -47,6 +47,6 @@ mod validator;
 // 공개 인터페이스
 pub use config::NgramConfig;
 pub use keymap::korean_to_eng;
-pub use model::{NgramError, NgramModel};
+pub use model::{NgramAnalysis, NgramError, NgramModel};
 pub use syllable_validator::check_syllable_structure;
-pub use validator::{KoreanValidator, ValidationResult};
+pub use validator::{KoreanValidator, RejectReason, ValidationResult};

@@ -50,18 +50,14 @@ fn detect_version() -> MacOSVersion {
     }
 
     // null terminator 제거
-    let version_str = std::str::from_utf8(&buf[..len.saturating_sub(1)])
-        .unwrap_or("13.0.0");
+    let version_str = std::str::from_utf8(&buf[..len.saturating_sub(1)]).unwrap_or("13.0.0");
 
     parse_version(version_str)
 }
 
 /// "15.2.1" 같은 버전 문자열을 파싱
 fn parse_version(s: &str) -> MacOSVersion {
-    let parts: Vec<u64> = s
-        .split('.')
-        .filter_map(|p| p.parse().ok())
-        .collect();
+    let parts: Vec<u64> = s.split('.').filter_map(|p| p.parse().ok()).collect();
 
     MacOSVersion {
         major: parts.first().copied().unwrap_or(13),
@@ -113,10 +109,22 @@ mod tests {
 
     #[test]
     fn test_is_sonoma_or_later() {
-        let v13 = MacOSVersion { major: 13, minor: 6, patch: 0 };
-        let v14 = MacOSVersion { major: 14, minor: 0, patch: 0 };
-        let v15 = MacOSVersion { major: 15, minor: 1, patch: 0 };
-        assert!(v13.major < 14);  // Ventura는 Sonoma 미만
+        let v13 = MacOSVersion {
+            major: 13,
+            minor: 6,
+            patch: 0,
+        };
+        let v14 = MacOSVersion {
+            major: 14,
+            minor: 0,
+            patch: 0,
+        };
+        let v15 = MacOSVersion {
+            major: 15,
+            minor: 1,
+            patch: 0,
+        };
+        assert!(v13.major < 14); // Ventura는 Sonoma 미만
         assert!(v14.major >= 14);
         assert!(v15.major >= 14);
     }

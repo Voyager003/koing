@@ -13,9 +13,8 @@ use std::sync::{Mutex, OnceLock};
 
 use super::menubar::EVENT_STATE;
 use super::{
-    DEBOUNCE_LABELS, DEBOUNCE_PRESETS,
-    SLOW_DEBOUNCE_LABELS, SLOW_DEBOUNCE_PRESETS,
-    SWITCH_LABELS, SWITCH_PRESETS,
+    DEBOUNCE_LABELS, DEBOUNCE_PRESETS, SLOW_DEBOUNCE_LABELS, SLOW_DEBOUNCE_PRESETS, SWITCH_LABELS,
+    SWITCH_PRESETS,
 };
 
 /// 설정 윈도우 참조 (재사용)
@@ -31,7 +30,9 @@ static SETTINGS_DELEGATE_CLASS: OnceLock<&'static Class> = OnceLock::new();
 // --- ObjC 액션 핸들러 ---
 
 extern "C" fn toggle_enabled_action(_: &Object, _: Sel, sender: id) {
-    let Some(state) = EVENT_STATE.get() else { return };
+    let Some(state) = EVENT_STATE.get() else {
+        return;
+    };
     unsafe {
         let checked: cocoa::foundation::NSInteger = msg_send![sender, state];
         let new_enabled = checked == 0; // 0=unchecked→enable, 1=checked→disable
@@ -49,7 +50,9 @@ extern "C" fn toggle_enabled_action(_: &Object, _: Sel, sender: id) {
 }
 
 extern "C" fn debounce_changed(_: &Object, _: Sel, sender: id) {
-    let Some(state) = EVENT_STATE.get() else { return };
+    let Some(state) = EVENT_STATE.get() else {
+        return;
+    };
     unsafe {
         let index: cocoa::foundation::NSInteger = msg_send![sender, indexOfSelectedItem];
         if (index as usize) < DEBOUNCE_PRESETS.len() {
@@ -65,7 +68,9 @@ extern "C" fn debounce_changed(_: &Object, _: Sel, sender: id) {
 }
 
 extern "C" fn switch_changed(_: &Object, _: Sel, sender: id) {
-    let Some(state) = EVENT_STATE.get() else { return };
+    let Some(state) = EVENT_STATE.get() else {
+        return;
+    };
     unsafe {
         let index: cocoa::foundation::NSInteger = msg_send![sender, indexOfSelectedItem];
         if (index as usize) < SWITCH_PRESETS.len() {
@@ -81,7 +86,9 @@ extern "C" fn switch_changed(_: &Object, _: Sel, sender: id) {
 }
 
 extern "C" fn slow_debounce_changed(_: &Object, _: Sel, sender: id) {
-    let Some(state) = EVENT_STATE.get() else { return };
+    let Some(state) = EVENT_STATE.get() else {
+        return;
+    };
     unsafe {
         let index: cocoa::foundation::NSInteger = msg_send![sender, indexOfSelectedItem];
         if (index as usize) < SLOW_DEBOUNCE_PRESETS.len() {
@@ -107,7 +114,10 @@ fn get_delegate_class() -> &'static Class {
                     decl.add_method(sel!(toggleEnabled:), toggle_enabled_action as ActionFn);
                     decl.add_method(sel!(debounceChanged:), debounce_changed as ActionFn);
                     decl.add_method(sel!(switchChanged:), switch_changed as ActionFn);
-                    decl.add_method(sel!(slowDebounceChanged:), slow_debounce_changed as ActionFn);
+                    decl.add_method(
+                        sel!(slowDebounceChanged:),
+                        slow_debounce_changed as ActionFn,
+                    );
                 }
 
                 decl.register()
@@ -160,8 +170,7 @@ pub fn show_settings_window() {
 
         // 윈도우 생성
         let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 330.0));
-        let style = NSWindowStyleMask::NSTitledWindowMask
-            | NSWindowStyleMask::NSClosableWindowMask;
+        let style = NSWindowStyleMask::NSTitledWindowMask | NSWindowStyleMask::NSClosableWindowMask;
         let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
             rect,
             style,
@@ -185,9 +194,10 @@ pub fn show_settings_window() {
         let _: () = msg_send![content_view, addSubview: checkbox];
 
         // --- 구분선 ---
-        let separator = create_separator(
-            NSRect::new(NSPoint::new(20.0, 245.0), NSSize::new(360.0, 1.0)),
-        );
+        let separator = create_separator(NSRect::new(
+            NSPoint::new(20.0, 245.0),
+            NSSize::new(360.0, 1.0),
+        ));
         let _: () = msg_send![content_view, addSubview: separator];
 
         // --- "변환 속도" 라벨 + 팝업 버튼 ---
@@ -200,7 +210,10 @@ pub fn show_settings_window() {
         let debounce_popup = create_popup_button(
             &DEBOUNCE_LABELS,
             NSRect::new(NSPoint::new(160.0, 202.0), NSSize::new(200.0, 26.0)),
-            DEBOUNCE_PRESETS.iter().position(|&v| v == config.debounce_ms).unwrap_or(1),
+            DEBOUNCE_PRESETS
+                .iter()
+                .position(|&v| v == config.debounce_ms)
+                .unwrap_or(1),
             delegate,
             sel!(debounceChanged:),
         );
@@ -216,7 +229,10 @@ pub fn show_settings_window() {
         let slow_debounce_popup = create_popup_button(
             &SLOW_DEBOUNCE_LABELS,
             NSRect::new(NSPoint::new(160.0, 157.0), NSSize::new(200.0, 26.0)),
-            SLOW_DEBOUNCE_PRESETS.iter().position(|&v| v == config.slow_debounce_ms).unwrap_or(1),
+            SLOW_DEBOUNCE_PRESETS
+                .iter()
+                .position(|&v| v == config.slow_debounce_ms)
+                .unwrap_or(1),
             delegate,
             sel!(slowDebounceChanged:),
         );
@@ -232,7 +248,10 @@ pub fn show_settings_window() {
         let switch_popup = create_popup_button(
             &SWITCH_LABELS,
             NSRect::new(NSPoint::new(160.0, 112.0), NSSize::new(200.0, 26.0)),
-            SWITCH_PRESETS.iter().position(|&v| v == config.switch_delay_ms).unwrap_or(0),
+            SWITCH_PRESETS
+                .iter()
+                .position(|&v| v == config.switch_delay_ms)
+                .unwrap_or(0),
             delegate,
             sel!(switchChanged:),
         );
@@ -262,7 +281,13 @@ pub fn show_settings_window() {
 
 // --- UI 헬퍼 함수들 ---
 
-unsafe fn create_checkbox(title: &str, frame: NSRect, checked: bool, target: id, action: Sel) -> id {
+unsafe fn create_checkbox(
+    title: &str,
+    frame: NSRect,
+    checked: bool,
+    target: id,
+    action: Sel,
+) -> id {
     let button: id = msg_send![class!(NSButton), alloc];
     let button: id = msg_send![button, initWithFrame: frame];
     let _: () = msg_send![button, setButtonType: 3i64]; // NSSwitchButton

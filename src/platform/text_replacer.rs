@@ -144,7 +144,6 @@ pub fn set_clipboard_string(content: &str) {
     }
 }
 
-
 /// 클립보드 설정 완료 대기 (폴링 방식)
 /// - expected: 기대하는 클립보드 내용
 /// - max_wait_ms: 최대 대기 시간 (밀리초)
@@ -180,14 +179,17 @@ fn event_source_state_id() -> CGEventSourceStateID {
 
 /// 키 이벤트 시뮬레이션
 fn simulate_key(keycode: CGKeyCode, key_down: bool, flags: CGEventFlags) -> Result<(), String> {
-    let source = CGEventSource::new(event_source_state_id())
-        .map_err(|_| "CGEventSource 생성 실패")?;
+    let source =
+        CGEventSource::new(event_source_state_id()).map_err(|_| "CGEventSource 생성 실패")?;
 
     let event =
         CGEvent::new_keyboard_event(source, keycode, key_down).map_err(|_| "CGEvent 생성 실패")?;
 
     event.set_flags(flags);
-    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, KOING_SYNTHETIC_EVENT_MARKER);
+    event.set_integer_value_field(
+        EventField::EVENT_SOURCE_USER_DATA,
+        KOING_SYNTHETIC_EVENT_MARKER,
+    );
     event.post(core_graphics::event::CGEventTapLocation::HID);
 
     Ok(())

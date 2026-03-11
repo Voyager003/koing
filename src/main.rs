@@ -1,16 +1,20 @@
 //! Koing - macOS 한영 자동변환 프로그램
 
 use koing::config::load_config;
-use koing::ngram::KoreanValidator;
+use koing::ngram::{KoreanValidator, RejectReason};
 use koing::platform::{
     event_tap::{start_event_tap, EventTapState, HotkeyConfig},
-    input_source::switch_to_korean_on_main_with_timeout,
+    input_source::{start_input_source_observers, switch_to_korean_on_main_with_timeout},
     os_version::{get_macos_version, is_sonoma_or_later},
-    permissions::{check_accessibility_permission, request_accessibility_permission, reset_accessibility_permission, wait_for_accessibility_permission},
+    permissions::{
+        check_accessibility_permission, request_accessibility_permission,
+        reset_accessibility_permission, wait_for_accessibility_permission,
+    },
     text_replacer::{replace_text, undo_replace_text},
 };
-use std::sync::atomic::Ordering as AtomicOrdering;
 use koing::ui::menubar::MenuBarApp;
+use koing::AutoDetector;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -62,6 +66,7 @@ fn main() {
 
     // 설정 로드
     let config = load_config();
+    start_input_source_observers();
 
     // 앱 실행 상태
     let running = Arc::new(AtomicBool::new(true));
@@ -72,31 +77,63 @@ fn main() {
     event_state.set_debounce_ms(config.debounce_ms);
     event_state.set_switch_delay_ms(config.switch_delay_ms);
     event_state.set_slow_debounce_ms(config.slow_debounce_ms);
+    if let Ok(mut detector) = event_state.auto_detector.lock() {
+        detector.set_never_convert_words(config.never_convert_words.clone());
+    }
 
     // 워커 스레드 채널 — 변환/Undo 작업을 단일 스레드에서 직렬 처리
     let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
 
     let event_state_for_worker = Arc::clone(&event_state);
+    let worker_config = config.clone();
     thread::spawn(move || {
-        let validator = KoreanValidator::new();
+        let validator = KoreanValidator::load_default().unwrap_or_else(|e| {
+            log::warn!(
+                "기본 N-gram 모델 로드 실패, 휴리스틱 모드로 계속 진행: {}",
+                e
+            );
+            KoreanValidator::new()
+        });
+        let mut english_detector = AutoDetector::default();
+        english_detector.set_never_convert_words(worker_config.never_convert_words);
 
         while let Ok(item) = work_rx.recv() {
             match item {
                 WorkItem::Convert(buffer, is_manual) => {
+                    if !is_manual && english_detector.is_blocked_english_word(&buffer) {
+                        log::debug!("자동 변환 차단: 영어 예외어 '{}'", buffer);
+                        continue;
+                    }
+
                     let result = validator.analyze(&buffer);
                     let hangul = result.converted;
 
                     // 변환 불가능 (원본과 동일)
                     if hangul == buffer {
+                        log::debug!("자동 변환 스킵: 변환 결과 동일 ({})", buffer);
                         continue;
                     }
 
                     if !is_manual {
                         // 자동 변환: 음절구조/n-gram 2차 검증
                         if hangul.chars().count() <= 1 {
+                            log::debug!("자동 변환 스킵: 1글자 변환 ({})", hangul);
+                            continue;
+                        }
+                        if english_detector.looks_like_english_word(&buffer)
+                            && result.seen_bigram_count == Some(0)
+                            && result.unknown_bigram_ratio.unwrap_or_default() >= 1.0
+                        {
+                            log::debug!(
+                                "자동 변환 스킵: 영어 입력 + 미등록 bigram ({}, {:?})",
+                                buffer,
+                                result.unknown_bigram_ratio
+                            );
                             continue;
                         }
                         if !result.should_convert {
+                            let reason = result.reject_reason.unwrap_or(RejectReason::LowScore);
+                            log::debug!("자동 변환 스킵: {:?} ({})", reason, buffer);
                             continue;
                         }
                     }

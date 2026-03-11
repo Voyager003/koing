@@ -26,8 +26,8 @@ impl Default for NgramConfig {
     fn default() -> Self {
         Self {
             smoothing_k: 0.001,
-            vocab_size: 11172,      // 한글 완성형 음절 수
-            threshold: -10.0,       // 로그 확률 기준
+            vocab_size: 11172, // 한글 완성형 음절 수
+            threshold: -10.0,  // 로그 확률 기준
             model_path: String::new(),
         }
     }

@@ -6,6 +6,7 @@ use super::patterns::{
     is_consonant_key, is_vowel_key, COMMON_ENGLISH_WORDS, ENGLISH_BIGRAMS, HANGUL_BIGRAMS,
 };
 use super::validator::has_excessive_jamo;
+use std::collections::HashSet;
 
 /// 자동 감지기 설정
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ impl Default for AutoDetectorConfig {
 pub struct AutoDetector {
     config: AutoDetectorConfig,
     enabled: bool,
+    never_convert_words: HashSet<String>,
 }
 
 impl AutoDetector {
@@ -44,6 +46,7 @@ impl AutoDetector {
         Self {
             config,
             enabled: true,
+            never_convert_words: HashSet::new(),
         }
     }
 
@@ -62,6 +65,31 @@ impl AutoDetector {
         self.enabled
     }
 
+    /// 사용자 정의 자동 변환 제외 단어 설정
+    pub fn set_never_convert_words(&mut self, words: Vec<String>) {
+        self.never_convert_words = words
+            .into_iter()
+            .map(|word| word.trim().to_ascii_lowercase())
+            .filter(|word| !word.is_empty())
+            .collect();
+    }
+
+    /// 자동 변환에서 제외할 영문 단어인지 확인
+    pub fn is_blocked_english_word(&self, buffer: &str) -> bool {
+        if buffer.is_empty() || !buffer.is_ascii() {
+            return false;
+        }
+
+        let lower = buffer.to_ascii_lowercase();
+        COMMON_ENGLISH_WORDS.contains(lower.as_str())
+            || self.never_convert_words.contains(lower.as_str())
+    }
+
+    /// 자동 변환을 차단해야 하는 영어 입력 패턴인지 확인
+    pub fn looks_like_english_word(&self, buffer: &str) -> bool {
+        self.is_blocked_english_word(buffer) || has_english_pattern(buffer)
+    }
+
     /// 입력 버퍼가 한글로 변환되어야 하는지 판별 (Space/Enter 시 사용)
     pub fn should_convert(&self, buffer: &str) -> bool {
         if !self.enabled {
@@ -73,8 +101,7 @@ impl AutoDetector {
         }
 
         // 영어 단어 필터: 흔한 영어 단어는 변환하지 않음
-        let lower = buffer.to_lowercase();
-        if COMMON_ENGLISH_WORDS.contains(lower.as_str()) {
+        if self.is_blocked_english_word(buffer) {
             return false;
         }
 
@@ -123,8 +150,7 @@ impl AutoDetector {
         }
 
         // 영어 단어 필터: 흔한 영어 단어는 변환하지 않음
-        let lower = buffer.to_lowercase();
-        if COMMON_ENGLISH_WORDS.contains(lower.as_str()) {
+        if self.is_blocked_english_word(buffer) {
             return false;
         }
 
@@ -245,8 +271,7 @@ impl AutoDetector {
 
         let exclusive_hangul_ratio = exclusive_hangul as f32 / total_bigrams as f32;
         let exclusive_english_ratio = exclusive_english as f32 / total_bigrams as f32;
-        let english_total_ratio =
-            (exclusive_english + both_match) as f32 / total_bigrams as f32;
+        let english_total_ratio = (exclusive_english + both_match) as f32 / total_bigrams as f32;
 
         // 영어 바이그램 비율이 50% 초과 시 한글 전용 비율만으로 점수 산정
         // 겹침(th, an 등)이 많아도 한글 전용 바이그램이 충분하면 높은 점수
@@ -355,7 +380,9 @@ fn has_english_pattern(buffer: &str) -> bool {
 
     // 영어 접미사
     let lower = buffer.to_lowercase();
-    let suffixes = ["tion", "ment", "ness", "ing", "able", "ful", "less", "ous", "ive", "ence", "ance"];
+    let suffixes = [
+        "tion", "ment", "ness", "ing", "able", "ful", "less", "ous", "ive", "ence", "ance",
+    ];
     for suffix in &suffixes {
         if lower.len() > suffix.len() && lower.ends_with(suffix) {
             return true;
@@ -491,6 +518,26 @@ mod tests {
         assert!(!detector.should_convert("home"));
         assert!(!detector.should_convert("code"));
         assert!(!detector.should_convert("file"));
+    }
+
+    #[test]
+    fn test_builtin_brand_words_are_blocked() {
+        let detector = AutoDetector::with_defaults();
+        assert!(detector.is_blocked_english_word("slack"));
+        assert!(detector.is_blocked_english_word("figma"));
+        assert!(!detector.should_convert("slack"));
+        assert!(!detector.should_convert_realtime("figma"));
+    }
+
+    #[test]
+    fn test_custom_never_convert_words_are_blocked() {
+        let mut detector = AutoDetector::with_defaults();
+        detector.set_never_convert_words(vec!["koing".to_string(), "discord".to_string()]);
+
+        assert!(detector.is_blocked_english_word("koing"));
+        assert!(detector.is_blocked_english_word("DISCORD"));
+        assert!(!detector.should_convert("koing"));
+        assert!(!detector.should_convert_realtime("discord"));
     }
 
     #[test]

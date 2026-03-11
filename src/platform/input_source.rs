@@ -1,18 +1,24 @@
 //! 입력 소스(한/영) 전환 기능
 //! Carbon API의 TIS (Text Input Source) 함수 사용
+#![allow(deprecated)] // cocoa 크레이트 deprecated API 사용
 
 use crate::platform::os_version::is_sonoma_or_later;
+use cocoa::base::{id, nil};
+use cocoa::foundation::NSString;
 use core_foundation::array::CFArrayRef;
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
+use objc::declare::ClassDecl;
+use objc::runtime::{Class, Object, Sel};
+use objc::{class, msg_send, sel, sel_impl};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-/// 캐싱된 입력 소스 상태 (true = 영문)
-static INPUT_SOURCE_IS_ENGLISH: AtomicBool = AtomicBool::new(true);
+/// 캐싱된 입력 소스 상태
+static INPUT_SOURCE_STATE: AtomicU8 = AtomicU8::new(InputSourceState::Unknown as u8);
 /// 캐시 유효 여부
 static INPUT_SOURCE_CACHE_VALID: AtomicBool = AtomicBool::new(false);
 /// 캐시 마지막 갱신 시간 (epoch ms)
@@ -21,6 +27,29 @@ static INPUT_SOURCE_CACHE_TIME: AtomicU64 = AtomicU64::new(0);
 const INPUT_SOURCE_CACHE_TTL_MS: u64 = 100;
 /// 비동기 캐시 갱신 진행 중 여부 (중복 갱신 방지)
 static REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// 알림 옵저버 등록 여부
+static OBSERVERS_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSourceState {
+    Unknown = 0,
+    English = 1,
+    NonEnglish = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputSourceSnapshot {
+    pub state: InputSourceState,
+    pub is_fresh: bool,
+}
+
+fn decode_input_source_state(raw: u8) -> InputSourceState {
+    match raw {
+        1 => InputSourceState::English,
+        2 => InputSourceState::NonEnglish,
+        _ => InputSourceState::Unknown,
+    }
+}
 
 /// 현재 시간을 epoch ms로 반환
 fn current_time_ms() -> u64 {
@@ -45,6 +74,8 @@ static KOREAN_SOURCE_CACHE: OnceLock<usize> = OnceLock::new();
 
 /// 캐싱된 영문 입력 소스 (CFRetain으로 소유권 유지)
 static ENGLISH_SOURCE_CACHE: OnceLock<usize> = OnceLock::new();
+static INPUT_SOURCE_OBSERVER_CLASS: OnceLock<&'static Class> = OnceLock::new();
+static INPUT_SOURCE_OBSERVER: Mutex<Option<SendId>> = Mutex::new(None);
 
 // Carbon 프레임워크 링크
 #[link(name = "Carbon", kind = "framework")]
@@ -62,6 +93,7 @@ extern "C" {
 
     // 상수 키 (런타임에 가져와야 함)
     static kTISPropertyInputSourceID: CFStringRef;
+    static kTISNotifySelectedKeyboardInputSourceChanged: CFStringRef;
 }
 
 // Core Foundation 배열 함수
@@ -69,7 +101,28 @@ extern "C" {
 extern "C" {
     fn CFArrayGetCount(theArray: CFArrayRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(theArray: CFArrayRef, idx: CFIndex) -> *const std::ffi::c_void;
+    fn CFNotificationCenterGetDistributedCenter() -> *mut std::ffi::c_void;
+    fn CFNotificationCenterAddObserver(
+        center: *mut std::ffi::c_void,
+        observer: *const std::ffi::c_void,
+        callback: extern "C" fn(
+            center: *mut std::ffi::c_void,
+            observer: *mut std::ffi::c_void,
+            name: CFStringRef,
+            object: *const std::ffi::c_void,
+            user_info: core_foundation::dictionary::CFDictionaryRef,
+        ),
+        name: CFStringRef,
+        object: *const std::ffi::c_void,
+        suspension_behavior: isize,
+    );
 }
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // ObjC observer 생명주기 유지를 위해 보관
+struct SendId(id);
+unsafe impl Send for SendId {}
+unsafe impl Sync for SendId {}
 
 /// 한글 입력 소스 ID (macOS 기본 한글)
 const KOREAN_INPUT_SOURCE_ID: &str = "com.apple.inputmethod.Korean.2SetKorean";
@@ -141,12 +194,16 @@ fn is_main_thread() -> bool {
 
 /// TIS API를 호출하여 입력 소스 캐시 갱신 (반드시 메인 스레드에서 호출)
 fn refresh_input_source_cache() {
-    let is_english = if let Some(id) = get_current_input_source_id() {
-        !is_korean_input_source_id(&id) || is_korean_english_submode(&id)
+    let state = if let Some(id) = get_current_input_source_id() {
+        if !is_korean_input_source_id(&id) || is_korean_english_submode(&id) {
+            InputSourceState::English
+        } else {
+            InputSourceState::NonEnglish
+        }
     } else {
-        true
+        InputSourceState::Unknown
     };
-    INPUT_SOURCE_IS_ENGLISH.store(is_english, Ordering::Release);
+    INPUT_SOURCE_STATE.store(state as u8, Ordering::Release);
     INPUT_SOURCE_CACHE_TIME.store(current_time_ms(), Ordering::Release);
     INPUT_SOURCE_CACHE_VALID.store(true, Ordering::Release);
     REFRESH_IN_PROGRESS.store(false, Ordering::Release);
@@ -164,6 +221,27 @@ pub fn schedule_async_refresh() {
     });
 }
 
+pub fn cached_input_source_snapshot() -> InputSourceSnapshot {
+    let state = decode_input_source_state(INPUT_SOURCE_STATE.load(Ordering::Acquire));
+
+    if !INPUT_SOURCE_CACHE_VALID.load(Ordering::Acquire) {
+        schedule_async_refresh();
+        return InputSourceSnapshot {
+            state,
+            is_fresh: false,
+        };
+    }
+
+    let cached_time = INPUT_SOURCE_CACHE_TIME.load(Ordering::Acquire);
+    let now = current_time_ms();
+    let is_fresh = now.saturating_sub(cached_time) < INPUT_SOURCE_CACHE_TTL_MS;
+    if !is_fresh {
+        schedule_async_refresh();
+    }
+
+    InputSourceSnapshot { state, is_fresh }
+}
+
 /// 현재 영문 입력 소스인지 확인 (TTL 기반 캐시 활용)
 ///
 /// TIS API(TISCopyCurrentKeyboardInputSource 등)는 macOS 26.2+에서
@@ -175,29 +253,103 @@ pub fn schedule_async_refresh() {
 /// 입력 소스 변경은 드물고 FlagsChanged에서 캐시를 무효화하므로
 /// stale 값이 실제로 틀릴 확률은 매우 낮습니다.
 pub fn is_english_input_source() -> bool {
-    // 캐시가 유효하고 TTL 이내이면 atomic 읽기만으로 즉시 반환
-    if INPUT_SOURCE_CACHE_VALID.load(Ordering::Acquire) {
-        let cached_time = INPUT_SOURCE_CACHE_TIME.load(Ordering::Acquire);
-        let now = current_time_ms();
-        if now.saturating_sub(cached_time) < INPUT_SOURCE_CACHE_TTL_MS {
-            return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
-        }
-        // TTL 만료 — stale 값 반환 + 비동기 갱신
-        schedule_async_refresh();
-        return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
-    }
-
-    // 캐시 미초기화 상태
-    if is_main_thread() {
-        // 메인 스레드: 즉시 동기 갱신 (블로킹 위험 없음)
+    // 캐시 미초기화 상태에서 메인 스레드면 즉시 갱신
+    if !INPUT_SOURCE_CACHE_VALID.load(Ordering::Acquire) && is_main_thread() {
         refresh_input_source_cache();
-    } else {
-        // event tap 스레드 등: 기본값(영문) 반환 + 비동기 갱신
-        schedule_async_refresh();
-        return INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire);
     }
 
-    INPUT_SOURCE_IS_ENGLISH.load(Ordering::Acquire)
+    matches!(
+        cached_input_source_snapshot().state,
+        InputSourceState::English | InputSourceState::Unknown
+    )
+}
+
+extern "C" fn distributed_input_source_changed(
+    _center: *mut std::ffi::c_void,
+    _observer: *mut std::ffi::c_void,
+    _name: CFStringRef,
+    _object: *const std::ffi::c_void,
+    _user_info: core_foundation::dictionary::CFDictionaryRef,
+) {
+    invalidate_input_source_cache();
+    schedule_async_refresh();
+}
+
+extern "C" fn handle_input_source_notification(_: &Object, _: Sel, _: id) {
+    invalidate_input_source_cache();
+    schedule_async_refresh();
+}
+
+fn observer_class() -> &'static Class {
+    INPUT_SOURCE_OBSERVER_CLASS.get_or_init(|| {
+        let superclass = class!(NSObject);
+        let mut decl = ClassDecl::new("KoingInputSourceObserver", superclass).unwrap();
+        type ActionFn = extern "C" fn(&Object, Sel, id);
+        unsafe {
+            decl.add_method(
+                sel!(handleNotification:),
+                handle_input_source_notification as ActionFn,
+            );
+        }
+        decl.register()
+    })
+}
+
+/// 입력 소스 관련 알림 옵저버 등록
+pub fn start_input_source_observers() {
+    if OBSERVERS_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    unsafe {
+        let center = CFNotificationCenterGetDistributedCenter();
+        if !center.is_null() {
+            const DELIVER_IMMEDIATELY: isize = 4;
+            CFNotificationCenterAddObserver(
+                center,
+                ptr::null(),
+                distributed_input_source_changed,
+                kTISNotifySelectedKeyboardInputSourceChanged,
+                ptr::null(),
+                DELIVER_IMMEDIATELY,
+            );
+        }
+
+        let observer: id = msg_send![observer_class(), new];
+
+        let default_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let keyboard_name = NSString::alloc(nil)
+            .init_str("NSTextInputContextKeyboardSelectionDidChangeNotification");
+        let _: () = msg_send![
+            default_center,
+            addObserver: observer
+            selector: sel!(handleNotification:)
+            name: keyboard_name
+            object: nil
+        ];
+
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let workspace_center: id = msg_send![workspace, notificationCenter];
+        let workspace_name =
+            NSString::alloc(nil).init_str("NSWorkspaceDidActivateApplicationNotification");
+        let _: () = msg_send![
+            workspace_center,
+            addObserver: observer
+            selector: sel!(handleNotification:)
+            name: workspace_name
+            object: nil
+        ];
+
+        let _: () = msg_send![keyboard_name, release];
+        let _: () = msg_send![workspace_name, release];
+
+        let mut guard = INPUT_SOURCE_OBSERVER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(SendId(observer));
+    }
+
+    schedule_async_refresh();
 }
 
 /// 특정 입력 소스 ID로 전환
@@ -259,7 +411,8 @@ fn get_cached_korean_source() -> Option<TISInputSourceRef> {
                     continue;
                 }
 
-                let source_id_ref = TISGetInputSourceProperty(source_ptr, kTISPropertyInputSourceID);
+                let source_id_ref =
+                    TISGetInputSourceProperty(source_ptr, kTISPropertyInputSourceID);
                 if source_id_ref.is_null() {
                     continue;
                 }
@@ -279,7 +432,11 @@ fn get_cached_korean_source() -> Option<TISInputSourceRef> {
         }
     });
 
-    if ptr == 0 { None } else { Some(ptr as TISInputSourceRef) }
+    if ptr == 0 {
+        None
+    } else {
+        Some(ptr as TISInputSourceRef)
+    }
 }
 
 /// 입력 소스 전환 후 실제로 전환되었는지 검증
@@ -334,7 +491,11 @@ pub fn switch_to_korean() -> Result<(), String> {
             return Ok(());
         }
         let current_id = get_current_input_source_id().unwrap_or_else(|| "unknown".to_string());
-        log::warn!("캐시 소스 한글 전환 실패 (ret={}, current={}), 리스트 검색으로 재시도", ret, current_id);
+        log::warn!(
+            "캐시 소스 한글 전환 실패 (ret={}, current={}), 리스트 검색으로 재시도",
+            ret,
+            current_id
+        );
     }
 
     // 2차 시도: 입력 소스 리스트에서 직접 검색 (캐시 stale 대응)
@@ -393,7 +554,8 @@ pub fn switch_to_korean_on_main_with_timeout(timeout: std::time::Duration) -> bo
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
-    let (guard, timeout_result) = cvar.wait_timeout_while(guard, timeout, |completed| !*completed)
+    let (guard, timeout_result) = cvar
+        .wait_timeout_while(guard, timeout, |completed| !*completed)
         .unwrap_or_else(|e| e.into_inner());
     let completed = *guard;
     if timeout_result.timed_out() && !completed {
@@ -449,7 +611,11 @@ fn get_cached_english_source() -> Option<TISInputSourceRef> {
         }
     });
 
-    if ptr == 0 { None } else { Some(ptr as TISInputSourceRef) }
+    if ptr == 0 {
+        None
+    } else {
+        Some(ptr as TISInputSourceRef)
+    }
 }
 
 /// 영문 입력 소스로 전환
@@ -508,12 +674,20 @@ mod tests {
     #[test]
     fn test_is_korean_input_source_id() {
         // macOS 기본 한글 입력기
-        assert!(is_korean_input_source_id("com.apple.inputmethod.Korean.2SetKorean"));
-        assert!(is_korean_input_source_id("com.apple.inputmethod.Korean.3SetKorean"));
-        assert!(is_korean_input_source_id("com.apple.inputmethod.Korean.Roman"));
+        assert!(is_korean_input_source_id(
+            "com.apple.inputmethod.Korean.2SetKorean"
+        ));
+        assert!(is_korean_input_source_id(
+            "com.apple.inputmethod.Korean.3SetKorean"
+        ));
+        assert!(is_korean_input_source_id(
+            "com.apple.inputmethod.Korean.Roman"
+        ));
 
         // 서드파티 입력기
-        assert!(is_korean_input_source_id("org.youknowone.inputmethod.Gureum.han2"));
+        assert!(is_korean_input_source_id(
+            "org.youknowone.inputmethod.Gureum.han2"
+        ));
 
         // 영문 입력기
         assert!(!is_korean_input_source_id("com.apple.keylayout.ABC"));
@@ -523,11 +697,17 @@ mod tests {
     #[test]
     fn test_is_korean_english_submode() {
         // 한글 IME 영문 서브모드 (A 모드) → 영문으로 취급해야 함
-        assert!(is_korean_english_submode("com.apple.inputmethod.Korean.Roman"));
+        assert!(is_korean_english_submode(
+            "com.apple.inputmethod.Korean.Roman"
+        ));
 
         // 한글 타이핑 모드 → 한글로 취급해야 함
-        assert!(!is_korean_english_submode("com.apple.inputmethod.Korean.2SetKorean"));
-        assert!(!is_korean_english_submode("com.apple.inputmethod.Korean.3SetKorean"));
+        assert!(!is_korean_english_submode(
+            "com.apple.inputmethod.Korean.2SetKorean"
+        ));
+        assert!(!is_korean_english_submode(
+            "com.apple.inputmethod.Korean.3SetKorean"
+        ));
 
         // 영문 입력기 → false (korean이 아니므로)
         assert!(!is_korean_english_submode("com.apple.keylayout.ABC"));

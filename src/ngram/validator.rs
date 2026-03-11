@@ -7,9 +7,10 @@
 
 use crate::core::converter::convert;
 use crate::detection::validator::has_incomplete_jamo;
+use std::path::PathBuf;
 
 use super::config::NgramConfig;
-use super::model::NgramModel;
+use super::model::{NgramAnalysis, NgramModel};
 use super::syllable_validator::check_syllable_structure;
 
 /// N-gram 기반 한글 검증기
@@ -63,6 +64,20 @@ impl KoreanValidator {
         })
     }
 
+    /// 일반 실행/앱 번들 환경에서 기본 모델 경로를 찾아 로드
+    pub fn load_default() -> Result<Self, super::model::NgramError> {
+        for candidate in default_model_candidates() {
+            if candidate.is_file() {
+                return Self::load(&candidate.to_string_lossy());
+            }
+        }
+
+        Err(super::model::NgramError::IoError(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "기본 N-gram 모델 경로를 찾을 수 없습니다",
+        )))
+    }
+
     /// 영문 입력을 한글로 변환해야 하는지 판정
     ///
     /// 3단계 파이프라인:
@@ -83,37 +98,7 @@ impl KoreanValidator {
     /// assert!(validator.should_convert_to_korean("dkssud")); // "안녕"
     /// ```
     pub fn should_convert_to_korean(&self, english_input: &str) -> bool {
-        // 빈 입력은 변환하지 않음
-        if english_input.is_empty() {
-            return false;
-        }
-
-        // 1단계: 영문 → 한글 변환
-        let converted = convert(english_input);
-
-        // 변환 결과가 원본과 동일하면 (변환 불가) false
-        if converted == english_input {
-            return false;
-        }
-
-        // 2단계: 낱자모 검사
-        if has_incomplete_jamo(&converted) {
-            return false;
-        }
-
-        // 2.5단계: 음절 구조 검사
-        if !check_syllable_structure(&converted) {
-            return false;
-        }
-
-        // 3단계: N-gram 스코어 검사 (모델이 있는 경우만)
-        if let Some(ref model) = self.model {
-            let score = model.score_with_config(&converted, &self.config);
-            return score >= self.config.threshold;
-        }
-
-        // 모델 없으면 낱자모 검사만으로 판정
-        true
+        self.analyze(english_input).should_convert
     }
 
     /// 변환된 한글의 N-gram 스코어 반환
@@ -130,15 +115,56 @@ impl KoreanValidator {
     /// # Returns
     /// (변환 결과, 낱자모 포함 여부, N-gram 스코어)
     pub fn analyze(&self, english_input: &str) -> ValidationResult {
-        let converted = convert(english_input);
-        let has_jamo = has_incomplete_jamo(&converted);
-        let syllable_valid = check_syllable_structure(&converted);
-        let score = self.score(&converted);
+        if english_input.is_empty() {
+            return ValidationResult::rejected(
+                english_input,
+                String::new(),
+                RejectReason::EmptyInput,
+                None,
+            );
+        }
 
-        let should_convert = !has_jamo
-            && converted != english_input
-            && syllable_valid
-            && score.map(|s| s >= self.config.threshold).unwrap_or(true);
+        let converted = convert(english_input);
+        if converted == english_input {
+            return ValidationResult::rejected(
+                english_input,
+                converted,
+                RejectReason::Unchanged,
+                None,
+            );
+        }
+
+        let has_jamo = has_incomplete_jamo(&converted);
+        if has_jamo {
+            return ValidationResult::rejected(
+                english_input,
+                converted,
+                RejectReason::IncompleteJamo,
+                None,
+            );
+        }
+
+        let syllable_valid = check_syllable_structure(&converted);
+        if !syllable_valid {
+            return ValidationResult::rejected(
+                english_input,
+                converted,
+                RejectReason::UnnaturalSyllables,
+                None,
+            );
+        }
+
+        let analysis = self
+            .model
+            .as_ref()
+            .map(|model| model.analyze_with_config(&converted, &self.config));
+        let score = analysis.as_ref().map(|result| result.score);
+        let should_convert = score.map(|s| s >= self.config.threshold).unwrap_or(true);
+        let reject_reason = if should_convert {
+            None
+        } else {
+            Some(RejectReason::LowScore)
+        };
 
         ValidationResult {
             original: english_input.to_string(),
@@ -147,6 +173,10 @@ impl KoreanValidator {
             has_unnatural_syllables: !syllable_valid,
             ngram_score: score,
             should_convert,
+            unknown_unigram_ratio: analysis.as_ref().map(|result| result.unknown_unigram_ratio),
+            unknown_bigram_ratio: analysis.as_ref().map(|result| result.unknown_bigram_ratio),
+            seen_bigram_count: analysis.as_ref().map(|result| result.seen_bigram_count),
+            reject_reason,
         }
     }
 
@@ -176,6 +206,73 @@ pub struct ValidationResult {
     pub ngram_score: Option<f64>,
     /// 최종 판정: 한글로 변환해야 하는지
     pub should_convert: bool,
+    /// 미등록 유니그램 비율 (모델이 없으면 None)
+    pub unknown_unigram_ratio: Option<f64>,
+    /// 미등록 바이그램 비율 (모델이 없으면 None)
+    pub unknown_bigram_ratio: Option<f64>,
+    /// 등록된 바이그램 개수 (모델이 없으면 None)
+    pub seen_bigram_count: Option<usize>,
+    /// 자동 변환 거부 이유
+    pub reject_reason: Option<RejectReason>,
+}
+
+impl ValidationResult {
+    fn rejected(
+        english_input: &str,
+        converted: String,
+        reject_reason: RejectReason,
+        analysis: Option<&NgramAnalysis>,
+    ) -> Self {
+        Self {
+            original: english_input.to_string(),
+            converted,
+            has_incomplete_jamo: matches!(reject_reason, RejectReason::IncompleteJamo),
+            has_unnatural_syllables: matches!(reject_reason, RejectReason::UnnaturalSyllables),
+            ngram_score: analysis.map(|result| result.score),
+            should_convert: false,
+            unknown_unigram_ratio: analysis.map(|result| result.unknown_unigram_ratio),
+            unknown_bigram_ratio: analysis.map(|result| result.unknown_bigram_ratio),
+            seen_bigram_count: analysis.map(|result| result.seen_bigram_count),
+            reject_reason: Some(reject_reason),
+        }
+    }
+}
+
+/// 자동 변환 거부 이유
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    EmptyInput,
+    Unchanged,
+    IncompleteJamo,
+    UnnaturalSyllables,
+    LowScore,
+}
+
+fn default_model_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("data").join("ngram_model.json"));
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("../Resources/data/ngram_model.json"));
+            candidates.push(exe_dir.join("../../data/ngram_model.json"));
+            candidates.push(exe_dir.join("../data/ngram_model.json"));
+        }
+    }
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique
+            .iter()
+            .any(|existing: &PathBuf| existing == &candidate)
+        {
+            unique.push(candidate);
+        }
+    }
+    unique
 }
 
 #[cfg(test)]
@@ -264,10 +361,10 @@ mod tests {
         // 낱자모가 포함되어 변환되지 않아야 하는 영어 단어들
         // (두벌식 변환 결과에 낱자모가 포함됨)
         let english_words_with_jamo = [
-            "name",   // ㅜ믇
-            "hello",  // ㅗ디ㅣㅐ
-            "code",   // ㅊㅐㅇㄷ
-            "test",   // ㅅㄷㅅㅅ
+            "name",  // ㅜ믇
+            "hello", // ㅗ디ㅣㅐ
+            "code",  // ㅊㅐㅇㄷ
+            "test",  // ㅅㄷㅅㅅ
         ];
 
         for word in &english_words_with_jamo {
@@ -301,8 +398,7 @@ mod tests {
             assert!(
                 result.should_convert,
                 "패턴 '{}' ('{}'이 됨)가 한글로 변환되어야 함",
-                input,
-                expected
+                input, expected
             );
         }
     }
@@ -350,5 +446,21 @@ mod tests {
         let high_threshold = NgramConfig::new().with_threshold(0.0);
         let validator = KoreanValidator::with_model(model, high_threshold);
         assert!(!validator.should_convert_to_korean("dkssud"));
+    }
+
+    #[test]
+    fn test_load_default_model() {
+        let validator = KoreanValidator::load_default().unwrap();
+        assert!(validator.has_model());
+    }
+
+    #[test]
+    fn test_analyze_tracks_unknown_ngram_metrics() {
+        let validator = KoreanValidator::load_default().unwrap();
+        let result = validator.analyze("slack");
+
+        assert_eq!(result.converted, "님차");
+        assert!(result.unknown_bigram_ratio.unwrap() >= 1.0);
+        assert_eq!(result.seen_bigram_count, Some(0));
     }
 }

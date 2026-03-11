@@ -13,6 +13,7 @@ macOS 한영 자동변환 유틸리티. 영문 모드에서 한글을 잘못 입
 ```bash
 brew tap voyager003/koing
 brew install --cask koing
+brew upgrade koing
 ```
 
 또는 [Releases](https://github.com/Voyager003/koing/releases)에서 zip을 다운로드하세요.
